@@ -1,5 +1,5 @@
 from datetime import datetime, date
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Literal
 
 class VenueOut(BaseModel):
@@ -180,3 +180,30 @@ class PortalData(BaseModel):
     zones: List[str] = []
 
     guests: List[PortalGuest] = []
+
+class AuthSignupIn(BaseModel):
+    org_id: int = Field(..., ge=1)
+    email: EmailStr
+    password: str = Field(..., min_length=8, max_length=200)
+
+class AuthLoginIn(BaseModel):
+    org_id: int = Field(..., ge=1)
+    email: EmailStr
+    password: str = Field(..., min_length=1, max_length=200)
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+
+class OrganizationOut(BaseModel):
+    id: int
+    name: str
+
+    class Config:
+        from_attributes = True
+
+class AuthMeOut(BaseModel):
+    user_id: int
+    email: EmailStr
+    org_id: int
+    org_name: str

@@ -1,4 +1,4 @@
-from sqlalchemy import BigInteger, String, Integer, Date, DateTime, ForeignKey, Text, Enum, Column, Boolean, text
+from sqlalchemy import BigInteger, String, Integer, Date, DateTime, ForeignKey, Text, Enum, Column, Boolean, text, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column
 from typing import Optional
 from .db import Base
@@ -86,3 +86,27 @@ class MemberPreference(Base):
     )
 
     assigned_seat_id = Column(BigInteger, ForeignKey("seats.id", ondelete="SET NULL"), nullable=True)
+
+
+class Organization(Base):
+    __tablename__ = "organizations"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False, unique=True)
+    created_at = Column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    org_id = Column(BigInteger, nullable=False, index=True)
+
+    email = Column(String(255), nullable=False)
+    password_hash = Column(String(255), nullable=False)
+
+    created_at = Column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+
+    # refresh support (nullable)
+    refresh_token_hash = Column(String(255), nullable=True)
+    refresh_token_expires_at = Column(DateTime, nullable=True)

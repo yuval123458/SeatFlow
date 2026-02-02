@@ -9,6 +9,10 @@ from datetime import datetime, timezone
 from .db import Base, engine, get_db
 from . import models, schemas
 import csv
+from app.routers.auth import router as auth_router
+from app.routers.organizations import router as organizations_router
+
+
 
 Base.metadata.create_all(bind=engine)
 
@@ -21,6 +25,10 @@ app.add_middleware(
   allow_methods=["*"],
   allow_headers=["*"],
 )
+
+app.include_router(auth_router)
+app.include_router(organizations_router)
+
 
 # Venues
 @app.get("/venues", response_model=list[schemas.VenueOut])

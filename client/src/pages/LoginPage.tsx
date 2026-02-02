@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
@@ -11,32 +11,97 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../components/ui/select";
+import { getOrganizations, login, type Organization } from "../lib/api";
+import { useLocation, useNavigate } from "react-router-dom";
 
 interface LoginPageProps {
   onLogin?: () => void;
 }
 
 export default function LoginPage({ onLogin }: LoginPageProps) {
+  const navigate = useNavigate();
+  const location = useLocation();
+
   const [step, setStep] = useState<"login" | "selectOrg">("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [rememberMe, setRememberMe] = useState(false);
 
-  const organizations = [
-    { id: "1", name: "Acme Corporation" },
-    { id: "2", name: "Global Events Ltd" },
-    { id: "3", name: "Stadium Management Co" },
-    { id: "4", name: "Concert Venues Inc" },
-  ];
+  const [orgs, setOrgs] = useState<Organization[]>([]);
+  const [orgsLoading, setOrgsLoading] = useState(false);
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const handleLogin = (e: React.FormEvent) => {
+  const orgOptions = useMemo(
+    () => orgs.map((o) => ({ id: String(o.id), name: o.name })),
+    [orgs],
+  );
+
+  const loadOrgs = async () => {
+    setError(null);
+    setOrgsLoading(true);
+    try {
+      const data = await getOrganizations();
+      setOrgs(data);
+    } catch (e: any) {
+      setError(e?.message || "Failed to load organizations");
+    } finally {
+      setOrgsLoading(false);
+    }
+  };
+
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    setError(null);
+
+    // basic client validation
+    if (!email.trim() || !password) {
+      setError("Email and password are required.");
+      return;
+    }
+
     setStep("selectOrg");
+    // fetch orgs when entering org step
+    if (orgs.length === 0) {
+      await loadOrgs();
+    }
   };
 
-  const handleOrgSelect = () => {
-    onLogin?.();
+  const handleOrgSelect = async (orgIdStr: string) => {
+    setError(null);
+    const org_id = Number(orgIdStr);
+    if (!org_id) {
+      setError("Invalid organization.");
+      return;
+    }
+
+    setLoginLoading(true);
+    try {
+      const token = await login(org_id, email.trim().toLowerCase(), password);
+
+      const storage = rememberMe ? window.localStorage : window.sessionStorage;
+      storage.setItem("access_token", token.access_token);
+      storage.setItem("token_type", token.token_type);
+      storage.setItem("org_id", String(org_id));
+
+      onLogin?.();
+
+      // Navigate to originally requested route (or dashboard)
+      const from = location.state?.from?.pathname || "/dashboard";
+      navigate(from, { replace: true });
+    } catch (e: any) {
+      setError(e?.message || "Login failed");
+    } finally {
+      setLoginLoading(false);
+    }
   };
+
+  useEffect(() => {
+    if (step === "selectOrg" && orgs.length === 0 && !orgsLoading) {
+      void loadOrgs();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step]);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-[#0B1220] via-[#1E293B] to-[#1E3A8A] flex items-center justify-center p-4">
@@ -61,6 +126,12 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
                 Sign in to your account to continue
               </p>
             </div>
+
+            {error && (
+              <div className="mb-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                {error}
+              </div>
+            )}
 
             <form onSubmit={handleLogin} className="space-y-5">
               <div>
@@ -142,31 +213,61 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
               </p>
             </div>
 
+            {error && (
+              <div className="mb-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                {error}
+              </div>
+            )}
+
             <div className="space-y-5">
               <div>
                 <Label htmlFor="organization">Organization</Label>
-                <Select onValueChange={handleOrgSelect}>
+                <Select
+                  onValueChange={handleOrgSelect}
+                  disabled={orgsLoading || loginLoading}
+                >
                   <SelectTrigger className="mt-1.5">
-                    <SelectValue placeholder="Select your organization" />
+                    <SelectValue
+                      placeholder={
+                        orgsLoading
+                          ? "Loading organizations..."
+                          : "Select your organization"
+                      }
+                    />
                   </SelectTrigger>
                   <SelectContent>
-                    {organizations.map((org) => (
+                    {orgOptions.map((org) => (
                       <SelectItem key={org.id} value={org.id}>
                         {org.name}
                       </SelectItem>
                     ))}
+                    {!orgsLoading && orgOptions.length === 0 && (
+                      <div className="px-3 py-2 text-sm text-[#64748B]">
+                        No organizations found.
+                      </div>
+                    )}
                   </SelectContent>
                 </Select>
               </div>
 
-              <div className="pt-4">
+              <div className="pt-4 flex items-center justify-between">
                 <button
                   type="button"
                   onClick={() => setStep("login")}
                   className="text-sm text-[#64748B] hover:text-[#1E3A8A] transition-colors"
+                  disabled={loginLoading}
                 >
                   ← Back to login
                 </button>
+
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={loadOrgs}
+                  disabled={orgsLoading || loginLoading}
+                >
+                  Refresh list
+                </Button>
               </div>
             </div>
           </Card>

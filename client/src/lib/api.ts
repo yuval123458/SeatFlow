@@ -115,3 +115,82 @@ export async function generateVenueSeats(
 
 // ADD: event creation wrapper (matches the import used by CreateEventPage.jsx)
 export const createEvent = (payload: any) => apiPost("/events", payload);
+
+export type Organization = { id: number; name: string };
+export type TokenOut = { access_token: string; token_type: "bearer" };
+export type AuthMeOut = {
+  user_id: number;
+  email: string;
+  org_id: number;
+  org_name: string;
+};
+
+function getAccessToken(): string | null {
+  return (
+    window.localStorage.getItem("access_token") ||
+    window.sessionStorage.getItem("access_token")
+  );
+}
+
+export async function getMe(): Promise<AuthMeOut> {
+  const token = getAccessToken();
+  if (!token) throw new Error("Missing access token");
+
+  const res = await fetch(`${API_BASE}/auth/me`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(text || `Request failed: ${res.status}`);
+  }
+  return (await res.json()) as AuthMeOut;
+}
+
+export async function logout(): Promise<void> {
+  await fetch(`${API_BASE}/auth/logout`, {
+    method: "POST",
+    credentials: "include", // so the refresh cookie can be cleared server-side
+  }).catch(() => {});
+
+  window.localStorage.removeItem("access_token");
+  window.localStorage.removeItem("token_type");
+  window.localStorage.removeItem("org_id");
+
+  window.sessionStorage.removeItem("access_token");
+  window.sessionStorage.removeItem("token_type");
+  window.sessionStorage.removeItem("org_id");
+}
+
+export async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(init?.headers || {}),
+    },
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(text || `Request failed: ${res.status}`);
+  }
+  return (await res.json()) as T;
+}
+
+export function getOrganizations(): Promise<Organization[]> {
+  return apiJson<Organization[]>("/organizations", { method: "GET" });
+}
+
+export function login(
+  org_id: number,
+  email: string,
+  password: string,
+): Promise<TokenOut> {
+  return apiJson<TokenOut>("/auth/login", {
+    method: "POST",
+    credentials: "include",
+    body: JSON.stringify({ org_id, email, password }),
+  });
+}

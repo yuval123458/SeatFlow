@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import {
   LayoutDashboard,
   MapPin,
@@ -20,18 +20,54 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "../components/ui/dropdown-menu";
+import { getMe, logout as apiLogout } from "../lib/api";
 
 interface TopNavbarProps {
   organizationName?: string;
   userName?: string;
   onMenuClick?: () => void;
+  onLogout?: () => void;
 }
 
 export function TopNavbar({
   organizationName = "Acme Corporation",
   userName = "John Doe",
   onMenuClick,
+  onLogout,
 }: TopNavbarProps) {
+  const [orgName, setOrgName] = useState<string>(
+    organizationName || "Loading…",
+  );
+  const [displayName, setDisplayName] = useState<string>(
+    userName || "Loading…",
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const me = await getMe();
+        if (cancelled) return;
+        setOrgName(me.org_name);
+        setDisplayName(me.email); // or change to first+last if you add those to /auth/me
+      } catch {
+        // fallback (token missing/expired): keep placeholders
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleLogout = async () => {
+    await apiLogout();
+    onLogout?.();
+    // minimal fallback if no routing logic is wired:
+    window.location.href = "/login";
+  };
+
   return (
     <nav className="bg-[#0B1220] border-b border-[#1E293B] sticky top-0 z-50">
       <div className="max-w-full mx-auto px-4 sm:px-6 lg:px-8">
@@ -52,7 +88,7 @@ export function TopNavbar({
               </div>
               <div className="hidden sm:block">
                 <h1 className="text-white font-semibold">SeatFlow</h1>
-                <p className="text-xs text-[#94A3B8]">{organizationName}</p>
+                <p className="text-xs text-[#94A3B8]">{orgName}</p>
               </div>
             </div>
           </div>
@@ -77,10 +113,11 @@ export function TopNavbar({
                     <User className="h-4 w-4 text-white" />
                   </div>
                   <span className="hidden md:inline text-white">
-                    {userName}
+                    {displayName}
                   </span>
                 </Button>
               </DropdownMenuTrigger>
+
               <DropdownMenuContent align="end" className="w-56">
                 <DropdownMenuLabel>My Account</DropdownMenuLabel>
                 <DropdownMenuSeparator />
@@ -93,7 +130,10 @@ export function TopNavbar({
                   Settings
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem className="text-[#DC2626]">
+                <DropdownMenuItem
+                  className="text-[#DC2626]"
+                  onClick={handleLogout}
+                >
                   <LogOut className="mr-2 h-4 w-4" />
                   Logout
                 </DropdownMenuItem>
