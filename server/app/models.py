@@ -46,7 +46,6 @@ class Event(Base):
         nullable=False,
         default="draft",
     )
-    submissions_locked: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
 class Member(Base):
@@ -76,7 +75,6 @@ class MemberPreference(Base):
 
     submitted_at = Column(DateTime, nullable=True)
 
-    # KEY FIX: match MySQL defaults so SQLAlchemy won't send NULL
     created_at = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
     updated_at = Column(
         DateTime,
@@ -107,6 +105,5 @@ class User(Base):
 
     created_at = Column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
 
-    # refresh support (nullable)
     refresh_token_hash = Column(String(255), nullable=True)
     refresh_token_expires_at = Column(DateTime, nullable=True)

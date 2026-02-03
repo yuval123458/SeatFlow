@@ -15,8 +15,6 @@ import {
 } from "../components/ui/select";
 
 import {
-  ZoomIn,
-  ZoomOut,
   Maximize2,
   Search,
   User,
@@ -48,9 +46,22 @@ export default function AdminManualCorrectionPage() {
   const [selectedPrefId, setSelectedPrefId] = useState<number | null>(null);
   const [selectedSeatId, setSelectedSeatId] = useState<number | null>(null);
 
-  const [zoomLevel, setZoomLevel] = useState(100);
   const [filterZone, setFilterZone] = useState<string>("all");
   const [searchText, setSearchText] = useState("");
+
+  const [mapWrapEl, setMapWrapEl] = useState<HTMLDivElement | null>(null);
+  const [wrapW, setWrapW] = useState(0);
+
+  // NEW: keep wrapW updated (this is what makes it behave like VenuesPage)
+  useEffect(() => {
+    if (!mapWrapEl) return;
+
+    const ro = new ResizeObserver(() => setWrapW(mapWrapEl.clientWidth));
+    ro.observe(mapWrapEl);
+    setWrapW(mapWrapEl.clientWidth);
+
+    return () => ro.disconnect();
+  }, [mapWrapEl]);
 
   const refresh = async () => {
     if (!eventId) return;
@@ -74,7 +85,6 @@ export default function AdminManualCorrectionPage() {
 
   useEffect(() => {
     refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [eventId]);
 
   const viewMode: ViewMode = useMemo(() => {
@@ -153,8 +163,35 @@ export default function AdminManualCorrectionPage() {
     return { total, available, assigned, blocked };
   }, [seatMap]);
 
-  const handleZoomIn = () => setZoomLevel((z) => Math.min(z + 10, 150));
-  const handleZoomOut = () => setZoomLevel((z) => Math.max(z - 10, 50));
+  const viewMetrics = useMemo(() => {
+    const pts = filteredSeats.filter(
+      (s) => s.x != null && s.y != null,
+    ) as Array<SeatMapSeat & { x: number; y: number }>;
+
+    if (pts.length === 0) return { viewW: 100, viewH: 100 };
+
+    const xs = pts.map((s) => Number(s.x));
+    const ys = pts.map((s) => Number(s.y));
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+
+    const w = Math.max(1, maxX - minX);
+    const h = Math.max(1, maxY - minY);
+    const pad = 20;
+
+    return {
+      viewW: w + pad * 2,
+      viewH: h + pad * 2,
+    };
+  }, [filteredSeats]);
+
+  const fittedHeight = useMemo(() => {
+    if (!wrapW || viewMetrics.viewW <= 0) return 560;
+    const h = Math.round((viewMetrics.viewH / viewMetrics.viewW) * wrapW);
+    return Math.max(560, h);
+  }, [wrapW, viewMetrics]);
 
   const doAssign = async () => {
     if (!eventId || !selectedPrefId || !selectedSeatId) return;
@@ -174,7 +211,6 @@ export default function AdminManualCorrectionPage() {
       return;
     }
 
-    // Optional UI guard: accessible requirement
     const needsAcc = Number(selectedPref?.needs_accessible ?? 0) === 1;
     if (needsAcc && seat.is_accessible !== 1) {
       setError("This member requires an accessible seat.");
@@ -265,51 +301,24 @@ export default function AdminManualCorrectionPage() {
           {/* Seat Map */}
           <div className="lg:col-span-3">
             <Card className="p-6 bg-white shadow-sm">
-              {/* Controls (Figma-style) */}
-              <div className="flex items-center justify-between mb-6">
-                <div className="flex items-center gap-2">
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    onClick={handleZoomOut}
-                    disabled={viewMode !== "normal"}
-                  >
-                    <ZoomOut className="h-4 w-4" />
-                  </Button>
-                  <span className="text-sm text-[#64748B] min-w-[60px] text-center">
-                    {zoomLevel}%
-                  </span>
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    onClick={handleZoomIn}
-                    disabled={viewMode !== "normal"}
-                  >
-                    <ZoomIn className="h-4 w-4" />
-                  </Button>
-                </div>
-
-                <div className="flex gap-2 items-center">
-                  <Badge className="bg-[#F1F5F9] text-[#64748B] hover:bg-[#F1F5F9]">
-                    Issues:{" "}
-                    {(issues?.summary?.seat_conflicts ?? 0) +
-                      (issues?.summary?.blocked_assignments ?? 0) +
-                      (issues?.summary?.accessibility_violations ?? 0)}
-                  </Badge>
-                  <Button variant="secondary" size="sm" disabled>
-                    <Maximize2 className="h-4 w-4" />
-                  </Button>
-                </div>
+              <div className="flex gap-2 items-center">
+                <Badge className="bg-[#F1F5F9] text-[#64748B] hover:bg-[#F1F5F9]">
+                  Issues:{" "}
+                  {(issues?.summary?.seat_conflicts ?? 0) +
+                    (issues?.summary?.blocked_assignments ?? 0) +
+                    (issues?.summary?.accessibility_violations ?? 0)}
+                </Badge>
+                <Button variant="secondary" size="sm" disabled>
+                  <Maximize2 className="h-4 w-4" />
+                </Button>
               </div>
 
-              {/* Stage (single source of truth; no duplicate inside SVG) */}
               <div className="mb-6">
                 <div className="h-16 bg-gradient-to-b from-[#1E3A8A] to-[#06B6D4] rounded-lg flex items-center justify-center text-white font-semibold">
                   STAGE
                 </div>
               </div>
 
-              {/* Loading / Empty / Normal */}
               {viewMode === "loading" && (
                 <div className="py-20 text-center">
                   <div className="inline-flex items-center gap-3 text-[#64748B]">
@@ -335,27 +344,29 @@ export default function AdminManualCorrectionPage() {
 
               {viewMode === "normal" && (
                 <div
-                  className="overflow-auto bg-[#F8FAFC] rounded-lg p-6"
-                  style={{
-                    transform: `scale(${zoomLevel / 100})`,
-                    transformOrigin: "top left",
+                  ref={(el) => {
+                    setMapWrapEl(el);
+                    if (el) setWrapW(el.clientWidth);
                   }}
+                  className="bg-[#F8FAFC] rounded-lg border border-[#E2E8F0] overflow-y-auto overflow-x-hidden"
+                  style={{ height: 640 }}
                 >
-                  <SeatMapSvg
-                    seats={filteredSeats}
-                    issueSeatIds={issueSeatIds}
-                    selectedSeatId={selectedSeatId}
-                    onSeatClick={(s) => {
-                      setSelectedSeatId(s.id);
-
-                      // If the seat is occupied, select that person for moving
-                      if (s.assignment?.preference_id) {
-                        setSelectedPrefId(s.assignment.preference_id);
-                      }
-                    }}
-                    showFront={false} // <-- removes the second "front" marker
-                    seatShape="square"
-                  />
+                  <div style={{ padding: 16 }}>
+                    <SeatMapSvg
+                      seats={filteredSeats}
+                      issueSeatIds={issueSeatIds}
+                      selectedSeatId={selectedSeatId}
+                      onSeatClick={(s) => {
+                        setSelectedSeatId(s.id);
+                        if (s.assignment?.preference_id)
+                          setSelectedPrefId(s.assignment.preference_id);
+                      }}
+                      showFront={false}
+                      seatShape="square"
+                      heightPx={fittedHeight}
+                      className="border-0 rounded-none bg-white"
+                    />
+                  </div>
                 </div>
               )}
 
@@ -371,8 +382,8 @@ export default function AdminManualCorrectionPage() {
                     <span className="text-sm text-[#64748B]">Assigned</span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <div className="w-4 h-4 bg-[#94A3B8] rounded" />
-                    <span className="text-sm text-[#64748B]">Blocked</span>
+                    <div className="w-4 h-4 bg-[#E2E8F0] rounded border-2 border-dashed border-[#7C3AED]" />
+                    <span className="text-sm text-[#64748B]">Aisle</span>
                   </div>
                   <div className="flex items-center gap-2">
                     <div className="w-4 h-4 bg-[#E2E8F0] rounded ring-2 ring-[#DC2626]" />
@@ -541,12 +552,9 @@ export default function AdminManualCorrectionPage() {
                 >
                   Clear assignment
                 </Button>
-
-                {/* REMOVED: View History button */}
               </div>
             </Card>
 
-            {/* Summary Stats (Figma-style) */}
             <Card className="p-6 bg-gradient-to-br from-[#1E3A8A] to-[#06B6D4] text-white shadow-lg">
               <h3 className="font-semibold mb-4">Seat Summary</h3>
               <div className="space-y-3">

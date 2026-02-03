@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Card } from "../components/ui/card";
 import { Button } from "../components/ui/button";
 import { Badge } from "../components/ui/badge";
@@ -39,40 +39,96 @@ export default function DashboardPage() {
       .finally(() => setLoading(false));
   }, []);
 
-  // Safe date format
   const formatDate = (iso?: string) => {
     if (!iso) return "—";
     const d = new Date(iso);
     return isNaN(d.getTime()) ? "—" : d.toLocaleDateString();
   };
 
-  // Optional: run assignment for the first event and refresh
-  const handleRunAssignment = async () => {
-    if (!events.length) return;
-    try {
-      setLoading(true);
-      await runAssignments(events[0].id);
-      const refreshed = (await getEvents()) as any[];
-      setEvents(refreshed ?? []);
-    } catch {
-      setError("Failed to run assignments");
-    } finally {
-      setLoading(false);
-    }
-  };
+  const activityFeed = useMemo(() => {
+    const items: Array<{
+      id: string;
+      user: string;
+      action: string;
+      target: string;
+      time: string;
+      icon: any;
+      color: string;
+    }> = [];
 
-  // Provide a simple feed to avoid ReferenceError (or remove the feed section)
-  const activityFeed = [
-    {
-      id: "1",
-      user: "System",
-      action: "updated assignment progress",
-      target: events[0]?.name ?? "—",
-      time: "just now",
-      icon: CheckCircle2,
-      color: "text-[#16A34A]",
-    },
-  ];
+    const sorted = [...events].sort((a, b) => {
+      const da = a?.event_date ? new Date(a.event_date).getTime() : 0;
+      const db = b?.event_date ? new Date(b.event_date).getTime() : 0;
+      return db - da;
+    });
+
+    for (const e of sorted) {
+      const total = Number(e.total_prefs ?? e.attendees_count ?? 0);
+      const assigned = Number(e.assigned_count ?? 0);
+      const unassigned = Math.max(total - assigned, 0);
+      const status = String(e.status ?? "draft");
+
+      if (status === "published") {
+        items.push({
+          id: `status:${e.id}`,
+          user: "System",
+          action: "marked event as published",
+          target: e.name ?? "—",
+          time: formatDate(e.event_date),
+          icon: CheckCircle2,
+          color: "text-[#16A34A]",
+        });
+      } else if (status === "in-progress" || status === "in_progress") {
+        items.push({
+          id: `status:${e.id}`,
+          user: "System",
+          action: "assignment is in progress",
+          target: e.name ?? "—",
+          time: formatDate(e.event_date),
+          icon: TrendingUp,
+          color: "text-[#06B6D4]",
+        });
+      } else {
+        items.push({
+          id: `status:${e.id}`,
+          user: "System",
+          action: "event is in draft",
+          target: e.name ?? "—",
+          time: formatDate(e.event_date),
+          icon: AlertCircle,
+          color: "text-[#64748B]",
+        });
+      }
+
+      if (total > 0) {
+        if (unassigned > 0) {
+          items.push({
+            id: `unassigned:${e.id}`,
+            user: "System",
+            action: "seats still unassigned",
+            target: `${e.name ?? "—"} • ${unassigned}/${total} remaining`,
+            time: formatDate(e.event_date),
+            icon: UserX,
+            color: "text-[#D97706]",
+          });
+        } else {
+          items.push({
+            id: `progress:${e.id}`,
+            user: "System",
+            action: "assignment completed",
+            target: `${e.name ?? "—"} • ${assigned}/${total}`,
+            time: formatDate(e.event_date),
+            icon: CheckCircle2,
+            color: "text-[#16A34A]",
+          });
+        }
+      }
+
+      if (items.length >= 12) break; // keep it compact
+    }
+
+    return items;
+  }, [events]);
 
   const getStatusBadge = (status: string) => {
     switch (status) {
@@ -99,7 +155,7 @@ export default function DashboardPage() {
     }
   };
 
-  // KPI data (derived from events)
+  // KPI data
   const totals = events.reduce(
     (acc, e) => {
       const total = Number(e.total_prefs ?? e.attendees_count ?? 0);
@@ -159,14 +215,6 @@ export default function DashboardPage() {
           </div>
           <div className="flex flex-wrap gap-3">
             <Button
-              variant="secondary"
-              className="gap-2"
-              onClick={handleRunAssignment}
-            >
-              <Play className="h-4 w-4" />
-              Run Assignment
-            </Button>
-            <Button
               className="bg-[#1E3A8A] hover:bg-[#2563EB] gap-2"
               onClick={() => navigate("/events/new")}
             >
@@ -191,19 +239,6 @@ export default function DashboardPage() {
                     <h3 className="text-3xl font-bold text-[#0B1220] mb-2">
                       {kpi.value}
                     </h3>
-                    <div className="flex items-center gap-1">
-                      <ArrowUpRight
-                        className={`h-4 w-4 ${kpi.trend === "up" ? "text-[#16A34A]" : "text-[#DC2626] rotate-90"}`}
-                      />
-                      <span
-                        className={`text-sm font-medium ${kpi.trend === "up" ? "text-[#16A34A]" : "text-[#DC2626]"}`}
-                      >
-                        {kpi.change}
-                      </span>
-                      <span className="text-sm text-[#64748B]">
-                        vs last month
-                      </span>
-                    </div>
                   </div>
                   <div
                     className={`w-12 h-12 rounded-lg bg-gradient-to-br ${kpi.color} flex items-center justify-center flex-shrink-0`}
@@ -225,10 +260,6 @@ export default function DashboardPage() {
                 <h2 className="text-xl font-semibold text-[#0B1220]">
                   Recent Events
                 </h2>
-                <Button variant="ghost" size="sm" className="text-[#1E3A8A]">
-                  View all
-                  <ArrowUpRight className="h-4 w-4 ml-1" />
-                </Button>
               </div>
             </div>
             <div className="overflow-x-auto">

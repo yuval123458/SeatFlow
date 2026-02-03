@@ -54,14 +54,12 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
     e.preventDefault();
     setError(null);
 
-    // basic client validation
     if (!email.trim() || !password) {
       setError("Email and password are required.");
       return;
     }
 
     setStep("selectOrg");
-    // fetch orgs when entering org step
     if (orgs.length === 0) {
       await loadOrgs();
     }
@@ -86,7 +84,6 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
 
       onLogin?.();
 
-      // Navigate to originally requested route (or dashboard)
       const from = location.state?.from?.pathname || "/dashboard";
       navigate(from, { replace: true });
     } catch (e: any) {
@@ -100,7 +97,6 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
     if (step === "selectOrg" && orgs.length === 0 && !orgsLoading) {
       void loadOrgs();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step]);
 
   return (
@@ -273,7 +269,6 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
           </Card>
         )}
 
-        {/* Footer */}
         <div className="mt-8 text-center">
           <p className="text-sm text-[#94A3B8]">
             © 2026 SeatFlow. All rights reserved.
@@ -281,7 +276,6 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
         </div>
       </div>
 
-      {/* Responsive Display Info */}
       <div className="fixed bottom-4 left-4 bg-[#0B1220]/80 backdrop-blur text-white px-3 py-2 rounded-lg text-xs font-mono">
         <span className="hidden lg:inline">Desktop 1440px+</span>
         <span className="lg:hidden">Mobile 390px</span>

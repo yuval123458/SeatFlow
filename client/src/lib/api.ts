@@ -1,7 +1,24 @@
 export const API_BASE = "http://localhost:8000";
 
+function getAccessToken(): string | null {
+  return (
+    window.localStorage.getItem("access_token") ||
+    window.sessionStorage.getItem("access_token")
+  );
+}
+
+function authHeaders(): Record<string, string> {
+  const token = getAccessToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 export async function apiGet(path: string): Promise<any> {
-  const res = await fetch(`${API_BASE}${path}`);
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "GET",
+    headers: {
+      ...authHeaders(),
+    },
+  });
   if (!res.ok) throw new Error(`GET ${path} failed`);
   return res.json();
 }
@@ -12,11 +29,19 @@ export async function apiPost(
   init?: RequestInit,
 ): Promise<any> {
   const isForm = body instanceof FormData;
+
   const res = await fetch(`${API_BASE}${path}`, {
     method: "POST",
     headers: isForm
-      ? (init?.headers as any)
-      : { "Content-Type": "application/json", ...(init?.headers as any) },
+      ? {
+          ...authHeaders(), // NEW
+          ...(init?.headers as any),
+        }
+      : {
+          "Content-Type": "application/json",
+          ...authHeaders(), // NEW
+          ...(init?.headers as any),
+        },
     body: isForm
       ? (body as FormData)
       : body !== undefined
@@ -24,23 +49,27 @@ export async function apiPost(
         : undefined,
     ...init,
   });
+
   if (!res.ok) throw new Error(`POST ${path} failed`);
   const ct = res.headers.get("content-type") || "";
   return ct.includes("application/json") ? res.json() : res.text();
 }
 
-// Convenience wrappers
 export const getVenues = () => apiGet("/venues");
 export const getEvents = () => apiGet(`/events`);
+
 export const runAssignments = (id: string | number, payload?: any) =>
   fetch(`${API_BASE}/events/${id}/assignments/run`, {
     method: "POST",
-    headers: payload ? { "Content-Type": "application/json" } : undefined,
+    headers: payload
+      ? { "Content-Type": "application/json", ...authHeaders() } // NEW
+      : { ...authHeaders() }, // NEW
     body: payload ? JSON.stringify(payload) : undefined,
   }).then((r) => {
     if (!r.ok) throw new Error("run failed");
     return r.json();
   });
+
 export const getEvent = (id: string | number) => apiGet(`/events/${id}`);
 export const getPreferenceSummary = (id: string | number) =>
   apiGet(`/events/${id}/preferences/summary`);
@@ -60,14 +89,21 @@ export const moveAssignment = (
 ) =>
   fetch(
     `${API_BASE}/events/${id}/assignments/move?preference_id=${preferenceId}&seat_id=${seatId}`,
-    { method: "POST" },
+    {
+      method: "POST",
+      headers: { ...authHeaders() }, // NEW
+    },
   ).then((r) => {
     if (!r.ok) throw new Error("move failed");
   });
+
 export const clearAssignment = (id: string | number, preferenceId: number) =>
   fetch(
     `${API_BASE}/events/${id}/assignments/clear?preference_id=${preferenceId}`,
-    { method: "POST" },
+    {
+      method: "POST",
+      headers: { ...authHeaders() }, // NEW
+    },
   ).then((r) => {
     if (!r.ok) throw new Error("clear failed");
   });
@@ -106,14 +142,11 @@ export async function createVenue(payload: {
 
 export async function generateVenueSeats(
   venueId: number,
-  payload: {
-    zones: Array<{ zone: string; rows: number; seats_per_row: number }>;
-  },
+  payload: GenerateVenueSeatsPayload,
 ): Promise<any> {
   return apiPost(`/venues/${venueId}/seats/generate`, payload);
 }
 
-// ADD: event creation wrapper (matches the import used by CreateEventPage.jsx)
 export const createEvent = (payload: any) => apiPost("/events", payload);
 
 export type Organization = { id: number; name: string };
@@ -125,49 +158,12 @@ export type AuthMeOut = {
   org_name: string;
 };
 
-function getAccessToken(): string | null {
-  return (
-    window.localStorage.getItem("access_token") ||
-    window.sessionStorage.getItem("access_token")
-  );
-}
-
-export async function getMe(): Promise<AuthMeOut> {
-  const token = getAccessToken();
-  if (!token) throw new Error("Missing access token");
-
-  const res = await fetch(`${API_BASE}/auth/me`, {
-    method: "GET",
-    headers: { Authorization: `Bearer ${token}` },
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(text || `Request failed: ${res.status}`);
-  }
-  return (await res.json()) as AuthMeOut;
-}
-
-export async function logout(): Promise<void> {
-  await fetch(`${API_BASE}/auth/logout`, {
-    method: "POST",
-    credentials: "include", // so the refresh cookie can be cleared server-side
-  }).catch(() => {});
-
-  window.localStorage.removeItem("access_token");
-  window.localStorage.removeItem("token_type");
-  window.localStorage.removeItem("org_id");
-
-  window.sessionStorage.removeItem("access_token");
-  window.sessionStorage.removeItem("token_type");
-  window.sessionStorage.removeItem("org_id");
-}
-
 export async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
     headers: {
       "Content-Type": "application/json",
+      ...authHeaders(), // NEW
       ...(init?.headers || {}),
     },
   });
@@ -194,3 +190,75 @@ export function login(
     body: JSON.stringify({ org_id, email, password }),
   });
 }
+
+export async function getMe(): Promise<AuthMeOut> {
+  return apiJson<AuthMeOut>("/auth/me", { method: "GET" });
+}
+
+export async function logout(): Promise<void> {
+  await fetch(`${API_BASE}/auth/logout`, {
+    method: "POST",
+    credentials: "include",
+  }).catch(() => {});
+
+  window.localStorage.removeItem("access_token");
+  window.localStorage.removeItem("token_type");
+  window.localStorage.removeItem("org_id");
+
+  window.sessionStorage.removeItem("access_token");
+  window.sessionStorage.removeItem("token_type");
+  window.sessionStorage.removeItem("org_id");
+}
+
+export type SeatMapSeat = {
+  id: number;
+  code: string;
+  x: number | null;
+  y: number | null;
+  is_blocked: number;
+  is_accessible: number;
+  is_aisle: number;
+  assignment: null | {
+    preference_id: number;
+    member_id: number;
+    first_name: string;
+    last_name: string;
+    needs_accessible: number;
+    group_code: string | null;
+  };
+};
+
+export async function getVenueSeatMap(venueId: number): Promise<SeatMapSeat[]> {
+  const res = await fetch(`${API_BASE}/venues/${venueId}/seatmap`, {
+    method: "GET",
+    headers: { ...authHeaders() }, // NEW
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(text || `Failed to load venue seatmap (${res.status})`);
+  }
+  return (await res.json()) as SeatMapSeat[];
+}
+
+export const updateEventStatus = (eventId: number | string, status: string) =>
+  apiJson(`/events/${eventId}/status`, {
+    method: "PATCH",
+    body: JSON.stringify({ status }),
+  });
+
+export type SeatLayout = "horizontal" | "vertical";
+
+export type GenerateVenueSeatsZone = {
+  zone: string;
+  rows: number;
+  seats_per_row: number;
+  aisle_seat_numbers?: number[];
+  accessible_rows?: number[];
+  accessible_per_row?: number;
+  accessible_side?: "start" | "end" | "both";
+};
+
+export type GenerateVenueSeatsPayload = {
+  layout: SeatLayout;
+  zones: GenerateVenueSeatsZone[];
+};

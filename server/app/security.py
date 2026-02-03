@@ -11,7 +11,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-insecure-change-me")
 JWT_ALG = os.getenv("JWT_ALG", "HS256")
-ACCESS_TOKEN_MINUTES = int(os.getenv("ACCESS_TOKEN_MINUTES", "15"))
+ACCESS_TOKEN_MINUTES = int(os.getenv("ACCESS_TOKEN_MINUTES", "1000"))
 
 REFRESH_DAYS = int(os.getenv("REFRESH_DAYS", "14"))
 REFRESH_PEPPER = os.getenv("REFRESH_PEPPER", "dev-insecure-change-me-too")

@@ -54,7 +54,6 @@ export default function PortalPage() {
             last_name: g.last_name || "",
             phone: g.phone || "",
 
-            // NEW
             gender: g.gender || "",
             preferred_zone: g.preferred_zone || "",
             wants_aisle: Boolean(g.wants_aisle),
@@ -69,7 +68,6 @@ export default function PortalPage() {
   const onSubmit = async () => {
     if (!token) return;
 
-    // NEW: require gender for all guests
     const missingGender = guests.some((g) => !String(g.gender || "").trim());
     if (missingGender) {
       setErr("Please select gender (Male/Female) for all guests.");
@@ -92,7 +90,6 @@ export default function PortalPage() {
           last_name: g.last_name || null,
           phone: g.phone || null,
 
-          // gender is required (M/F)
           gender: g.gender,
 
           preferred_zone: g.preferred_zone || null,
@@ -132,7 +129,6 @@ export default function PortalPage() {
             {data.member_first_name} {data.member_last_name}
           </p>
 
-          {/* Optional: show assigned seat read-only if server provides it */}
           {data.assigned_seat_code && (
             <div className="mb-4 text-sm">
               <span className="text-[#64748B]">Assigned seat: </span>
@@ -165,8 +161,6 @@ export default function PortalPage() {
                 ))}
               </select>
             </label>
-
-            {/* Removed: Preferred seat code input */}
 
             <label className="flex items-center gap-2">
               <input
@@ -227,7 +221,6 @@ export default function PortalPage() {
                       }}
                     />
 
-                    {/* Gender (Male/Female only) */}
                     <select
                       className="border rounded px-2 py-1 bg-white"
                       value={g.gender || ""}
@@ -309,7 +302,7 @@ export default function PortalPage() {
                       first_name: "",
                       last_name: "",
                       phone: "",
-                      gender: "", // <-- keep empty so "Gender" shows
+                      gender: "",
                       preferred_zone: "",
                       wants_aisle: false,
                       needs_accessible: false,

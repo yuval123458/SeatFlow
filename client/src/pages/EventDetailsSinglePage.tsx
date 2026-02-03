@@ -16,17 +16,13 @@ import {
   TableRow,
 } from "../components/ui/table";
 import {
-  Upload,
   FileText,
   Play,
   CheckCircle2,
   AlertCircle,
-  XCircle,
   MapPin,
   Calendar,
   Users,
-  Settings,
-  Download,
   Eye,
   Search,
   RotateCw,
@@ -41,8 +37,8 @@ import {
   clearAssignment,
   getEventParticipants,
   importEventMembers,
+  updateEventStatus,
 } from "../lib/api";
-import { Link } from "react-router-dom";
 
 type HardConstraint = {
   id: string;
@@ -62,30 +58,29 @@ export default function EventDetailsSinglePage() {
   const [copiedId, setCopiedId] = useState<number | null>(null);
 
   const assignmentResults = useMemo(() => {
-    const rows = (participants || [])
-      .filter(
-        (p: any) =>
-          p?.assigned_seat_code || p?.assigned_seat_id || p?.seat_code,
-      )
+    const zoneFromSeatCode = (code?: string) => {
+      if (!code) return "—";
+      const z = String(code).split("-")[0]?.trim();
+      return z || "—";
+    };
+
+    return (participants || [])
+      .filter((p: any) => p?.assigned_seat_code)
       .map((p: any) => {
         const member =
           `${p?.first_name ?? ""} ${p?.last_name ?? ""}`.trim() || "—";
-        const seat =
-          p?.assigned_seat_code ??
-          p?.seat_code ??
-          (p?.assigned_seat_id ? `#${p.assigned_seat_id}` : "—");
+
+        const seat = p?.assigned_seat_code ?? "—";
 
         return {
           id: p?.preference_id ?? p?.member_id ?? seat,
           member,
-          email: p?.email ?? "—",
+          phone: p?.phone ?? "—",
           seat,
-          zone: p?.zone ?? p?.assigned_zone ?? "—",
-          satisfaction: Number(p?.satisfaction ?? p?.score ?? 0),
+          zone: zoneFromSeatCode(seat),
+          satisfaction: null as number | null,
         };
       });
-
-    return rows;
   }, [participants]);
 
   const hardConstraints: HardConstraint[] = [
@@ -126,6 +121,10 @@ export default function EventDetailsSinglePage() {
   const [importError, setImportError] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
+  const [statusDraft, setStatusDraft] = useState<string>("draft");
+  const [savingStatus, setSavingStatus] = useState(false);
+  const [statusError, setStatusError] = useState("");
+
   useEffect(() => {
     if (!eventId) return;
     setLoading(true);
@@ -143,13 +142,32 @@ export default function EventDetailsSinglePage() {
   }, [eventId]);
 
   useEffect(() => {
+    if (eventData?.status) setStatusDraft(eventData.status);
+  }, [eventData?.status]);
+
+  const saveStatus = async () => {
+    if (!eventId) return;
+    setSavingStatus(true);
+    setStatusError("");
+    try {
+      const updated = await updateEventStatus(eventId, statusDraft);
+      setEventData(updated);
+      const is = await getEventIssues(eventId);
+      setIssues(is);
+    } catch (e: any) {
+      setStatusError(e?.message || "Failed to update status");
+    } finally {
+      setSavingStatus(false);
+    }
+  };
+
+  useEffect(() => {
     if (!eventId) return;
     getEventParticipants(Number(eventId))
       .then((rows) => setParticipants(rows || []))
       .catch(() => setParticipants([]));
   }, [eventId]);
 
-  // ADD THIS: auto dry-run validation when a file is selected
   useEffect(() => {
     if (!selectedFile || !eventId) return;
 
@@ -172,7 +190,6 @@ export default function EventDetailsSinglePage() {
 
         setImportSummary(summary);
 
-        // optional: show a friendly error banner if invalid
         if (!summary?.ok || (summary?.errors?.length ?? 0) > 0) {
           setImportError(
             "CSV validation failed. Fix the errors and try again.",
@@ -269,7 +286,47 @@ export default function EventDetailsSinglePage() {
     importSummary?.ok === true &&
     (importSummary?.errors?.length ?? 0) === 0;
 
-  const warnings: any[] = [];
+  const warnings = useMemo(() => {
+    const out: any[] = [];
+    const s = issues?.summary;
+
+    const push = (
+      severity: "error" | "warning" | "info",
+      category: string,
+      message: string,
+      detail: string,
+    ) => {
+      out.push({
+        id: `${category}:${message}`,
+        severity,
+        category,
+        message,
+        detail,
+      });
+    };
+
+    if (!s) return out;
+
+    const unassignedCnt = Number(s.unassigned ?? 0);
+    const seatConflictsCnt = Number(s.seat_conflicts ?? 0);
+    const blockedCnt = Number(s.blocked_assignments ?? 0);
+
+    push("warning", "Unassigned", `Unassigned: ${unassignedCnt}`, "");
+    push(
+      "warning",
+      "Seat conflicts",
+      `Seat conflicts: ${seatConflictsCnt}`,
+      "",
+    );
+    push(
+      "warning",
+      "Blocked assignments",
+      `Blocked assignments: ${blockedCnt}`,
+      "",
+    );
+
+    return out;
+  }, [issues]);
 
   const getSeverityBadge = (severity: string) => {
     switch (severity) {
@@ -300,7 +357,6 @@ export default function EventDetailsSinglePage() {
   const total = Number(eventData?.total_prefs ?? 0);
   const unassigned = Math.max(total - assigned, 0);
 
-  // Redirect from /events to most recent event
   useEffect(() => {
     if (eventId) return;
     (async () => {
@@ -315,9 +371,7 @@ export default function EventDetailsSinglePage() {
           });
           navigate(`/events/${sorted[0].id}`, { replace: true });
         }
-      } catch {
-        // ignore
-      }
+      } catch {}
     })();
   }, [eventId, navigate]);
 
@@ -354,17 +408,39 @@ export default function EventDetailsSinglePage() {
               </span>
             </div>
           </div>
-          <div className="flex flex-wrap gap-3">
-            <Button variant="secondary" className="gap-2">
-              <Download className="h-4 w-4" />
-              Export
-            </Button>
-            <Button className="bg-[#1E3A8A] hover:bg-[#2563EB] gap-2">
-              <CheckCircle2 className="h-4 w-4" />
-              Publish Assignments
+        </div>
+
+        <Card className="p-4 bg-white shadow-sm">
+          <div className="flex flex-col md:flex-row md:items-center gap-3 md:gap-4">
+            <div className="text-sm font-semibold text-[#0B1220]">
+              Event status
+            </div>
+
+            <select
+              className="border border-[#E2E8F0] rounded px-3 py-2 text-sm bg-white max-w-[260px]"
+              value={statusDraft}
+              onChange={(e) => setStatusDraft(e.target.value)}
+              disabled={savingStatus}
+            >
+              <option value="draft">draft</option>
+              <option value="preferences_open">preferences_open</option>
+              <option value="locked">locked</option>
+              <option value="published">published</option>
+            </select>
+
+            <Button
+              onClick={saveStatus}
+              disabled={
+                savingStatus ||
+                !eventData ||
+                statusDraft === (eventData?.status ?? "draft")
+              }
+              className="bg-[#1E3A8A] hover:bg-[#2563EB]"
+            >
+              {savingStatus ? "Saving..." : "Save status"}
             </Button>
           </div>
-        </div>
+        </Card>
 
         {/* Main Content */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -377,7 +453,6 @@ export default function EventDetailsSinglePage() {
                   Import Members
                 </h2>
 
-                {/* CHANGE: badge reflects current state */}
                 {validating ? (
                   <Badge className="bg-[#DBEAFE] text-[#1E3A8A] hover:bg-[#DBEAFE] gap-1">
                     <RotateCw className="h-3 w-3 animate-spin" />
@@ -401,7 +476,6 @@ export default function EventDetailsSinglePage() {
                 )}
               </div>
 
-              {/* ADD: CSV requirements */}
               <div className="mb-4 rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] p-3">
                 <div className="text-sm font-semibold text-[#0B1220] mb-1">
                   CSV required columns
@@ -607,17 +681,12 @@ export default function EventDetailsSinglePage() {
               </div>
             </Card>
 
-            {/* Results Table */}
             <Card className="bg-white shadow-sm overflow-hidden">
               <div className="p-6 border-b border-[#E2E8F0]">
                 <div className="flex items-center justify-between mb-4">
                   <h2 className="text-xl font-semibold text-[#0B1220]">
                     Assignment Results
                   </h2>
-                  <Button variant="ghost" size="sm" className="gap-2">
-                    <Download className="h-4 w-4" />
-                    Export CSV
-                  </Button>
                 </div>
                 <div className="relative">
                   <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-[#64748B]" />
@@ -630,14 +699,11 @@ export default function EventDetailsSinglePage() {
                     <TableRow className="bg-[#F8FAFC]">
                       <TableHead>Member</TableHead>
                       <TableHead className="hidden md:table-cell">
-                        Email
+                        Phone
                       </TableHead>
                       <TableHead>Seat</TableHead>
                       <TableHead className="hidden sm:table-cell">
                         Zone
-                      </TableHead>
-                      <TableHead className="hidden lg:table-cell">
-                        Score
                       </TableHead>
                     </TableRow>
                   </TableHeader>
@@ -655,14 +721,17 @@ export default function EventDetailsSinglePage() {
                           <TableCell className="font-medium text-[#0B1220]">
                             {result.member}
                           </TableCell>
+
                           <TableCell className="hidden md:table-cell text-[#64748B]">
-                            {result.email}
+                            {result.phone}
                           </TableCell>
+
                           <TableCell>
                             <span className="font-mono font-medium text-[#1E3A8A]">
                               {result.seat}
                             </span>
                           </TableCell>
+
                           <TableCell className="hidden sm:table-cell">
                             <Badge
                               className={
@@ -676,19 +745,8 @@ export default function EventDetailsSinglePage() {
                               {result.zone}
                             </Badge>
                           </TableCell>
-                          <TableCell className="hidden lg:table-cell">
-                            <div className="flex items-center gap-2">
-                              <div className="flex-1 h-2 bg-[#E2E8F0] rounded-full max-w-[60px]">
-                                <div
-                                  className="h-full bg-gradient-to-r from-[#1E3A8A] to-[#06B6D4] rounded-full"
-                                  style={{ width: `${result.satisfaction}%` }}
-                                />
-                              </div>
-                              <span className="text-sm font-medium text-[#0B1220]">
-                                {result.satisfaction}
-                              </span>
-                            </div>
-                          </TableCell>
+
+                          <TableCell className="hidden lg:table-cell"></TableCell>
                         </TableRow>
                       ))
                     )}
@@ -706,7 +764,6 @@ export default function EventDetailsSinglePage() {
                 Run Assignment
               </h2>
 
-              {/* ADD: Seat map / manual correction button */}
               <Button
                 onClick={() => navigate(`/events/${eventId}/corrections`)}
                 variant="secondary"
@@ -913,7 +970,6 @@ export default function EventDetailsSinglePage() {
               </div>
             </Card>
 
-            {/* Share links (unchanged) */}
             <div className="space-y-6">
               <div className="p-6 bg-white rounded shadow-sm">
                 <div className="flex items-center justify-between mb-3">

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { Card } from "../components/ui/card";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
@@ -17,11 +17,12 @@ import {
   Users,
   Grid3x3,
   ChevronRight,
-  X,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 
-import { apiGet, getVenueSections } from "../lib/api";
+import SeatMapSvg from "../components/SeatMapSvg";
+import type { SeatMapSeat } from "../components/SeatMapSvg";
+import { apiGet, getVenueSections, getVenueSeatMap } from "../lib/api";
 
 export default function VenuesPage() {
   const navigate = useNavigate();
@@ -32,6 +33,11 @@ export default function VenuesPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [sections, setSections] = useState<any[]>([]);
+  const [venueSeats, setVenueSeats] = useState<SeatMapSeat[]>([]);
+  const [seatmapLoading, setSeatmapLoading] = useState(false);
+
+  const [mapWrapEl, setMapWrapEl] = useState<HTMLDivElement | null>(null);
+  const [wrapW, setWrapW] = useState(0);
 
   useEffect(() => {
     setLoading(true);
@@ -41,7 +47,7 @@ export default function VenuesPage() {
         setLoading(false);
         if ((data as any[]).length > 0) setSelectedVenue((data as any[])[0].id);
       })
-      .catch((err) => {
+      .catch(() => {
         setError("Failed to load venues");
         setLoading(false);
       });
@@ -54,11 +60,83 @@ export default function VenuesPage() {
       .catch(() => setSections([]));
   }, [selectedVenue]);
 
-  const filteredVenues = venues.filter((venue) =>
-    (venue.name ?? "").toLowerCase().includes(searchTerm.toLowerCase()),
-  );
+  useEffect(() => {
+    if (!selectedVenue) return;
+
+    setSeatmapLoading(true);
+    getVenueSeatMap(Number(selectedVenue))
+      .then((data: SeatMapSeat[]) =>
+        setVenueSeats(data as unknown as SeatMapSeat[]),
+      )
+      .catch(() => setVenueSeats([]))
+      .finally(() => setSeatmapLoading(false));
+  }, [selectedVenue]);
+
+  useEffect(() => {
+    if (!mapWrapEl) return;
+
+    const ro = new ResizeObserver(() => setWrapW(mapWrapEl.clientWidth));
+    ro.observe(mapWrapEl);
+    setWrapW(mapWrapEl.clientWidth);
+
+    return () => ro.disconnect();
+  }, [mapWrapEl]);
+
+  const categoryOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const v of venues) {
+      const c = (v?.category ?? "").trim();
+      if (c) set.add(c);
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [venues]);
+
+  const filteredVenues = venues.filter((venue) => {
+    const nameOk = (venue.name ?? "")
+      .toLowerCase()
+      .includes(searchTerm.toLowerCase());
+    const categoryOk =
+      filterCategory === "all"
+        ? true
+        : (venue.category ?? "") === filterCategory;
+    return nameOk && categoryOk;
+  });
 
   const venueDetails = venues.find((v) => v.id === selectedVenue);
+
+  const viewMetrics = useMemo(() => {
+    const pts = venueSeats.filter((s) => s.x != null && s.y != null) as Array<
+      SeatMapSeat & { x: number; y: number }
+    >;
+
+    if (pts.length === 0) return { viewW: 100, viewH: 100 };
+
+    const xs = pts.map((s) => Number(s.x));
+    const ys = pts.map((s) => Number(s.y));
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+
+    const w = Math.max(1, maxX - minX);
+    const h = Math.max(1, maxY - minY);
+    const pad = 20;
+
+    const stageHeight = Math.max(10, Math.min(h * 0.04, 16));
+    const stageGap = 10;
+    const extraTop = stageHeight + stageGap;
+
+    return {
+      viewW: w + pad * 2,
+      viewH: h + pad * 2 + extraTop,
+    };
+  }, [venueSeats]);
+
+  const fittedHeight = useMemo(() => {
+    if (!wrapW || viewMetrics.viewW <= 0) return 560;
+    const h = Math.round((viewMetrics.viewH / viewMetrics.viewW) * wrapW);
+    return Math.max(560, h);
+  }, [wrapW, viewMetrics]);
 
   return (
     <div className="min-h-screen bg-[#F8FAFC] p-4 md:p-6 lg:p-8">
@@ -98,9 +176,11 @@ export default function VenuesPage() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All Categories</SelectItem>
-                <SelectItem value="Convention">Convention</SelectItem>
-                <SelectItem value="Stadium">Stadium</SelectItem>
-                <SelectItem value="Theater">Theater</SelectItem>
+                {categoryOptions.map((c) => (
+                  <SelectItem key={c} value={c}>
+                    {c}
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
           </div>
@@ -152,7 +232,9 @@ export default function VenuesPage() {
                       </div>
                     </div>
                     <ChevronRight
-                      className={`h-5 w-5 text-[#64748B] flex-shrink-0 ${selectedVenue === venue.id ? "text-[#1E3A8A]" : ""}`}
+                      className={`h-5 w-5 text-[#64748B] flex-shrink-0 ${
+                        selectedVenue === venue.id ? "text-[#1E3A8A]" : ""
+                      }`}
                     />
                   </div>
                 </Card>
@@ -180,9 +262,6 @@ export default function VenuesPage() {
                         </div>
                       </div>
                     </div>
-                    <Button variant="secondary" size="sm">
-                      Edit Venue
-                    </Button>
                   </div>
 
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -255,107 +334,28 @@ export default function VenuesPage() {
 
                 {/* Seat Map Preview */}
                 <Card className="p-6 bg-white shadow-sm">
-                  <div className="flex items-center justify-between mb-4">
+                  <div className="mb-4">
                     <h3 className="text-lg font-semibold text-[#0B1220]">
                       Seat Map Preview
                     </h3>
-                    <Button variant="ghost" size="sm">
-                      Edit Layout
-                    </Button>
                   </div>
 
-                  {/* Simple Grid Representation */}
-                  <div className="bg-[#F8FAFC] rounded-lg p-6">
-                    <div className="mb-6">
-                      <div className="h-12 bg-gradient-to-b from-[#1E3A8A] to-[#06B6D4] rounded-lg flex items-center justify-center text-white font-semibold">
-                        STAGE
-                      </div>
-                    </div>
-
-                    <div className="space-y-4">
-                      {/* VIP Section */}
-                      <div className="grid grid-cols-10 gap-2">
-                        {Array.from({ length: 20 }).map((_, i) => (
-                          <div
-                            key={`vip-${i}`}
-                            className="aspect-square bg-[#1E3A8A] rounded hover:bg-[#2563EB] cursor-pointer transition-colors"
-                            title="VIP - Available"
-                          />
-                        ))}
-                      </div>
-
-                      {/* Premium Section */}
-                      <div className="grid grid-cols-10 gap-2">
-                        {Array.from({ length: 30 }).map((_, i) => (
-                          <div
-                            key={`premium-${i}`}
-                            className={`aspect-square rounded cursor-pointer transition-colors ${
-                              i % 5 === 0
-                                ? "bg-[#94A3B8] cursor-not-allowed"
-                                : i % 7 === 0
-                                  ? "bg-[#16A34A]"
-                                  : "bg-[#06B6D4] hover:bg-[#22D3EE]"
-                            }`}
-                            title={
-                              i % 5 === 0
-                                ? "Blocked"
-                                : i % 7 === 0
-                                  ? "Assigned"
-                                  : "Premium - Available"
-                            }
-                          />
-                        ))}
-                      </div>
-
-                      {/* General Section */}
-                      <div className="grid grid-cols-10 gap-2">
-                        {Array.from({ length: 40 }).map((_, i) => (
-                          <div
-                            key={`general-${i}`}
-                            className={`aspect-square rounded cursor-pointer transition-colors ${
-                              i % 6 === 0
-                                ? "bg-[#94A3B8] cursor-not-allowed"
-                                : i % 4 === 0
-                                  ? "bg-[#16A34A]"
-                                  : "bg-[#E2E8F0] hover:bg-[#CBD5E1]"
-                            }`}
-                            title={
-                              i % 6 === 0
-                                ? "Blocked"
-                                : i % 4 === 0
-                                  ? "Assigned"
-                                  : "General - Available"
-                            }
-                          />
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* Legend */}
-                    <div className="flex flex-wrap gap-4 mt-6 pt-6 border-t border-[#E2E8F0]">
-                      <div className="flex items-center gap-2">
-                        <div className="w-4 h-4 bg-[#E2E8F0] rounded"></div>
-                        <span className="text-sm text-[#64748B]">
-                          Available
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <div className="w-4 h-4 bg-[#16A34A] rounded"></div>
-                        <span className="text-sm text-[#64748B]">Assigned</span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <div className="w-4 h-4 bg-[#94A3B8] rounded"></div>
-                        <span className="text-sm text-[#64748B]">Blocked</span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <div className="w-4 h-4 bg-[#1E3A8A] rounded"></div>
-                        <span className="text-sm text-[#64748B]">VIP</span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <div className="w-4 h-4 bg-[#06B6D4] rounded"></div>
-                        <span className="text-sm text-[#64748B]">Premium</span>
-                      </div>
-                    </div>
+                  <div
+                    ref={setMapWrapEl}
+                    className="rounded-lg border border-slate-200 bg-white overflow-y-auto overflow-x-hidden"
+                    style={{ height: 520 }} // viewport height; scrolling happens vertically
+                  >
+                    <SeatMapSvg
+                      seats={venueSeats}
+                      issueSeatIds={new Set()}
+                      selectedSeatId={null}
+                      onSeatClick={undefined}
+                      showFront={true}
+                      frontLabel="Stage"
+                      seatShape="square"
+                      heightPx={fittedHeight} // KEY: height based on width-fit
+                      className="border-0 rounded-none bg-white"
+                    />
                   </div>
                 </Card>
               </>

@@ -1,6 +1,7 @@
 from datetime import datetime, date
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Literal
+from pydantic import BaseModel, Field
 
 class VenueOut(BaseModel):
     id: int
@@ -9,7 +10,6 @@ class VenueOut(BaseModel):
     status: str
     category: Optional[str] = None
 
-    # allow GET /venues to return aggregates, and POST /venues to omit them
     seat_count: int = 0
     zones_count: int = 0
     events_count: int = 0
@@ -48,7 +48,7 @@ class SeatOut(BaseModel):
 class EventCreate(BaseModel):
     venue_id: int
     name: str
-    event_date: Optional[datetime] = None
+    event_date: Optional[date] = None
 
 class EventOut(BaseModel):
     id: int
@@ -56,7 +56,6 @@ class EventOut(BaseModel):
     name: str
     event_date: Optional[datetime] = None
     status: str
-    submissions_locked: int
     venue_name: Optional[str] = None
     attendees_count: Optional[int] = None
     assigned_count: Optional[int] = None
@@ -129,7 +128,6 @@ class PortalGuest(BaseModel):
     last_name: Optional[str] = None
     phone: Optional[str] = None
 
-    # NEW: required, only allowed values in your DB
     gender: Literal["male", "female"]
 
     preferred_zone: Optional[str] = None
@@ -159,8 +157,18 @@ class ZoneSpec(BaseModel):
     rows: int = Field(..., ge=1, le=200)
     seats_per_row: int = Field(..., ge=1, le=500)
 
+class GenerateSeatsZone(BaseModel):
+    zone: str
+    rows: int = Field(..., ge=1)
+    seats_per_row: int = Field(..., ge=1)
+    aisle_seat_numbers: List[int] = []  # unchanged: applies to every row
+    accessible_rows: List[int] = []                 # e.g., [1,2,10]
+    accessible_per_row: int = Field(1, ge=1)       # how many seats per affected row
+    accessible_side: Literal["start", "end", "both"] = "start"
+
 class GenerateSeatsPayload(BaseModel):
-    zones: List[ZoneSpec]
+    zones: List[GenerateSeatsZone]
+    layout: Literal["horizontal", "vertical"] = "horizontal"  # NEW
 
 class PortalData(BaseModel):
     event_name: str
@@ -207,3 +215,8 @@ class AuthMeOut(BaseModel):
     email: EmailStr
     org_id: int
     org_name: str
+
+EventStatus = Literal["draft", "preferences_open", "locked", "published"]
+
+class EventStatusUpdate(BaseModel):
+    status: EventStatus

@@ -24,12 +24,15 @@ type Props = {
   selectedSeatId?: number | null;
   onSeatClick?: (seat: SeatMapSeat) => void;
 
-  // Visual helpers
   showFront?: boolean;
   frontLabel?: string;
-
-  // NEW: make it look like the Figma grid
   seatShape?: "circle" | "square";
+
+  heightPx?: number;
+  widthPx?: number;
+  className?: string;
+
+  baseScale?: number;
 };
 
 function clamp(n: number, min: number, max: number) {
@@ -41,9 +44,13 @@ export default function SeatMapSvg({
   issueSeatIds,
   selectedSeatId,
   onSeatClick,
-  showFront = true,
+  showFront = false,
   frontLabel = "Front / Stage",
   seatShape = "circle",
+  heightPx = 560,
+  widthPx,
+  className = "",
+  baseScale = 1,
 }: Props) {
   const pts = useMemo(
     () => seats.filter((s) => s.x != null && s.y != null),
@@ -67,6 +74,7 @@ export default function SeatMapSvg({
   const pad = 20;
 
   const seatRadius = useMemo(() => {
+    if (pts.length > 350) return 4.0;
     if (pts.length <= 1) return 10;
 
     let minNN = Number.POSITIVE_INFINITY;
@@ -85,20 +93,37 @@ export default function SeatMapSvg({
     }
 
     if (!isFinite(minNN) || minNN <= 0) return 6;
-    return clamp(minNN * 0.35, 3.5, 12);
+    return clamp(minNN * 0.35, 3.0, 12);
   }, [pts]);
 
+  const strokeWidth = useMemo(
+    () => clamp(seatRadius * 0.28, 0.6, 2),
+    [seatRadius],
+  );
+  const size = seatRadius * 2;
+
+  const accessibleFontSize = useMemo(() => {
+    const px = size * 0.95;
+    return clamp(px, 8, 26);
+  }, [size]);
+
+  const showAccessibleIcon = accessibleFontSize >= 8;
+
   const fill = (s: SeatMapSeat) => {
-    if (s.is_blocked === 1) return "#94A3B8"; // blocked
-    if (s.assignment) return "#F59E0B"; // occupied (orange)
-    return "#E2E8F0"; // vacant
+    if (s.is_blocked === 1) return "#94A3B8";
+    if (s.assignment) return "#16A34A";
+    return "#E2E8F0";
   };
 
   const stroke = (s: SeatMapSeat) => {
     if (selectedSeatId === s.id) return "#06B6D4";
     if (issueSeatIds?.has(s.id)) return "#DC2626";
+    if (s.is_aisle === 1) return "#7C3AED";
+    if (s.is_accessible === 1) return "#0891B2";
     return "#CBD5E1";
   };
+
+  const dash = (s: SeatMapSeat) => (s.is_aisle === 1 ? "3 2" : undefined);
 
   if (pts.length === 0) {
     return (
@@ -108,38 +133,52 @@ export default function SeatMapSvg({
     );
   }
 
-  const stageHeight = clamp(h * 0.08, 12, 28);
-  const stageY = bounds.minY - pad + 4;
-  const stageX = bounds.minX - pad + 4;
-  const stageW = w + pad * 2 - 8;
+  const stageHeight = clamp(h * 0.04, 10, 16);
+  const stageGap = 10;
+  const extraTop = showFront ? stageHeight + stageGap : 0;
 
-  const size = seatRadius * 2;
+  const viewMinX = bounds.minX - pad;
+  const viewMinY = bounds.minY - pad - extraTop;
+  const viewW = w + pad * 2;
+  const viewH = h + pad * 2 + extraTop;
+
+  const stageX = viewMinX + 6;
+  const stageY = viewMinY + 6;
+  const stageW = viewW - 12;
+
+  const effectiveHeight = Math.round(heightPx * baseScale);
+  const effectiveWidth =
+    widthPx != null ? Math.round(widthPx * baseScale) : undefined;
 
   return (
     <svg
-      className="w-full h-[560px] bg-slate-50 rounded-lg border border-slate-200"
-      viewBox={`${bounds.minX - pad} ${bounds.minY - pad} ${w + pad * 2} ${h + pad * 2}`}
-      preserveAspectRatio="xMidYMid meet"
+      className={`w-full block bg-slate-50 rounded-lg border border-slate-200 ${className}`}
+      style={{
+        height: effectiveHeight,
+        width: effectiveWidth ?? "100%",
+      }}
+      viewBox={`${viewMinX} ${viewMinY} ${viewW} ${viewH}`}
+      preserveAspectRatio="xMinYMin meet"
     >
       {showFront && (
-        <g>
+        <g style={{ pointerEvents: "none" }}>
           <rect
             x={stageX}
             y={stageY}
             width={stageW}
             height={stageHeight}
-            rx={6}
+            rx={999}
             fill="#0F172A"
-            opacity={0.12}
+            opacity={0.08}
           />
           <text
             x={stageX + stageW / 2}
             y={stageY + stageHeight / 2}
             textAnchor="middle"
             dominantBaseline="middle"
-            fontSize={clamp(stageHeight * 0.55, 10, 14)}
+            fontSize={10}
             fill="#0F172A"
-            opacity={0.65}
+            opacity={0.5}
           >
             {frontLabel}
           </text>
@@ -158,10 +197,12 @@ export default function SeatMapSvg({
               y={Number(s.y) - size / 2}
               width={size}
               height={size}
-              rx={Math.max(2, seatRadius * 0.45)}
+              rx={Math.max(1, seatRadius * 0.35)}
               fill={fill(s)}
               stroke={stroke(s)}
-              strokeWidth={2}
+              strokeWidth={strokeWidth}
+              strokeDasharray={dash(s)}
+              vectorEffect="non-scaling-stroke"
             />
           ) : (
             <circle
@@ -170,13 +211,38 @@ export default function SeatMapSvg({
               r={seatRadius}
               fill={fill(s)}
               stroke={stroke(s)}
-              strokeWidth={2}
+              strokeWidth={strokeWidth}
+              strokeDasharray={dash(s)}
+              vectorEffect="non-scaling-stroke"
             />
           )}
 
-          {/* Simple hover tooltip (browser native) */}
+          {showAccessibleIcon &&
+            s.is_accessible === 1 &&
+            s.is_blocked !== 1 && (
+              <text
+                x={Number(s.x)}
+                y={Number(s.y)}
+                textAnchor="middle"
+                dy="0.35em"
+                fontSize={accessibleFontSize}
+                fill="#0B1220"
+                opacity={0.92}
+                pointerEvents="none"
+                style={{
+                  paintOrder: "stroke",
+                  stroke: "#FFFFFF",
+                  strokeWidth: clamp(accessibleFontSize * 0.12, 1, 2.5),
+                }}
+              >
+                ♿
+              </text>
+            )}
+
           <title>
             {s.code}
+            {s.is_aisle === 1 ? " • Aisle" : ""}
+            {s.is_accessible === 1 ? " • Accessible" : ""}
             {s.assignment
               ? ` • Occupied by ${s.assignment.first_name} ${s.assignment.last_name}`
               : " • Vacant"}
