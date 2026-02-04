@@ -71,8 +71,8 @@ export function EventDetailsScreen(props: { eventId?: string }) {
   const [runProgress, setRunProgress] = useState(0);
 
   const [preferenceWeight, setPreferenceWeight] = useState([60]);
-  const [groupWeight, setGroupWeight] = useState([70]);
   const [stabilityWeight, setStabilityWeight] = useState([80]);
+  const [groupAdjacency, setGroupAdjacency] = useState(true);
 
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [validating, setValidating] = useState(false);
@@ -205,8 +205,8 @@ export function EventDetailsScreen(props: { eventId?: string }) {
 
       await runAssignments(eventId, {
         preference_weight: preferenceWeight[0],
-        group_weight: groupWeight[0],
         stability_weight: stabilityWeight[0],
+        group_adjacency: groupAdjacency,
       });
 
       await refreshEventAndIssues();
@@ -240,6 +240,8 @@ export function EventDetailsScreen(props: { eventId?: string }) {
     try {
       const summary = await importEventMembers(Number(eventId), selectedFile);
       setImportSummary(summary);
+
+      await refreshEventAndIssues();
 
       const rows = await getEventParticipants(Number(eventId));
       setParticipants(rows || []);
@@ -445,7 +447,7 @@ export function EventDetailsScreen(props: { eventId?: string }) {
 
               {importSummary && (
                 <div className="text-sm text-[#0B1220]">
-                  • Members created: {importSummary.created_members ?? 0}
+                  • Members to upload: {importSummary.created_members ?? 0}
                 </div>
               )}
 
@@ -503,13 +505,36 @@ export function EventDetailsScreen(props: { eventId?: string }) {
                   Objective Weights
                 </h3>
 
+                <div className="mb-6 p-3 rounded-lg bg-[#F8FAFC] border border-[#E2E8F0] flex items-center justify-between">
+                  <div>
+                    <Label className="block">Seat groups side-by-side</Label>
+                    <p className="text-xs text-[#64748B]">
+                      Place members with the same group_code contiguously before
+                      other rules.
+                    </p>
+                  </div>
+                  <input
+                    type="checkbox"
+                    className="h-5 w-5 accent-[#1E3A8A]"
+                    checked={groupAdjacency}
+                    onChange={(e) => setGroupAdjacency(e.target.checked)}
+                  />
+                </div>
+
                 <div className="space-y-6">
                   <div>
                     <div className="flex items-center justify-between mb-2">
                       <Label>Preference Satisfaction</Label>
-                      <span className="text-sm font-semibold text-[#1E3A8A]">
-                        {preferenceWeight[0]}%
-                      </span>
+                      <div className="flex items-center gap-2">
+                        {preferenceWeight[0] >= 90 && (
+                          <Badge className="bg-[#DCFCE7] text-[#16A34A] hover:bg-[#DCFCE7]">
+                            Hard rule
+                          </Badge>
+                        )}
+                        <span className="text-sm font-semibold text-[#1E3A8A]">
+                          {preferenceWeight[0]}%
+                        </span>
+                      </div>
                     </div>
                     <Slider
                       value={preferenceWeight}
@@ -521,25 +546,17 @@ export function EventDetailsScreen(props: { eventId?: string }) {
 
                   <div>
                     <div className="flex items-center justify-between mb-2">
-                      <Label>Group Togetherness</Label>
-                      <span className="text-sm font-semibold text-[#1E3A8A]">
-                        {groupWeight[0]}%
-                      </span>
-                    </div>
-                    <Slider
-                      value={groupWeight}
-                      onValueChange={setGroupWeight}
-                      max={100}
-                      step={1}
-                    />
-                  </div>
-
-                  <div>
-                    <div className="flex items-center justify-between mb-2">
                       <Label>Stability</Label>
-                      <span className="text-sm font-semibold text-[#1E3A8A]">
-                        {stabilityWeight[0]}%
-                      </span>
+                      <div className="flex items-center gap-2">
+                        {stabilityWeight[0] >= 90 && (
+                          <Badge className="bg-[#DCFCE7] text-[#16A34A] hover:bg-[#DCFCE7]">
+                            Hard rule
+                          </Badge>
+                        )}
+                        <span className="text-sm font-semibold text-[#1E3A8A]">
+                          {stabilityWeight[0]}%
+                        </span>
+                      </div>
                     </div>
                     <Slider
                       value={stabilityWeight}

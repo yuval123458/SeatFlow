@@ -236,6 +236,54 @@ export default function AdminManualCorrectionScreen({ eventId }: Props) {
     }
   };
 
+  const [issueFilter, setIssueFilter] = useState<
+    "aisle" | "zone" | "group_not_adjacent"
+  >("aisle");
+
+  const issuePeople = useMemo(() => {
+    const rows: Array<{
+      preference_id: number;
+      first_name: string;
+      last_name?: string | null;
+      seat_code?: string | null;
+      tag: string;
+    }> = [];
+    if (!issues) return rows;
+
+    if (issueFilter === "aisle") {
+      for (const r of issues.aisle_mismatches ?? []) {
+        rows.push({
+          preference_id: Number(r.preference_id),
+          first_name: String(r.first_name ?? ""),
+          last_name: r.last_name ?? "",
+          seat_code: r.seat_code ?? null,
+          tag: "Wants aisle",
+        });
+      }
+    } else if (issueFilter === "zone") {
+      for (const r of issues.zone_mismatches ?? []) {
+        rows.push({
+          preference_id: Number(r.preference_id),
+          first_name: String(r.first_name ?? ""),
+          last_name: r.last_name ?? "",
+          seat_code: r.seat_code ?? null,
+          tag: `${r.preferred_zone ?? "—"} ≠ ${r.actual_zone ?? "—"}`,
+        });
+      }
+    } else if (issueFilter === "group_not_adjacent") {
+      for (const r of issues.group_not_adjacent_members ?? []) {
+        rows.push({
+          preference_id: Number(r.preference_id),
+          first_name: String(r.first_name ?? ""),
+          last_name: r.last_name ?? "",
+          seat_code: r.seat_code ?? null,
+          tag: String(r.group_code ?? ""),
+        });
+      }
+    }
+    return rows;
+  }, [issues, issueFilter]);
+
   return (
     <div className="min-h-screen bg-[#F8FAFC] p-4 md:p-6 lg:p-8">
       <div className="max-w-[1440px] mx-auto space-y-6">
@@ -563,6 +611,62 @@ export default function AdminManualCorrectionScreen({ eventId }: Props) {
                 </div>
               </div>
             </Card>
+          </div>
+        </div>
+
+        <div className="pt-3 border-t border-[#E2E8F0]">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-sm font-semibold text-[#0B1220]">
+              Review seated issues
+            </span>
+            <select
+              className="border border-[#E2E8F0] rounded px-2 py-1 text-sm bg-white"
+              value={issueFilter}
+              onChange={(e) => setIssueFilter(e.target.value as any)}
+            >
+              <option value="aisle">
+                Aisle mismatches ({issues?.summary?.aisle_mismatches ?? 0})
+              </option>
+              <option value="zone">
+                Zone mismatches ({issues?.summary?.zone_mismatches ?? 0})
+              </option>
+              <option value="group_not_adjacent">
+                Groups not contiguous (
+                {issues?.summary?.groups_not_adjacent ?? 0})
+              </option>
+            </select>
+          </div>
+
+          <div className="max-h-[220px] overflow-auto space-y-2 border border-[#E2E8F0] rounded-lg p-2">
+            {issuePeople.map((p) => (
+              <button
+                key={`${issueFilter}-${p.preference_id}`}
+                className={`w-full text-left p-2 rounded border transition-colors ${
+                  selectedPrefId === p.preference_id
+                    ? "border-[#06B6D4] bg-[#ECFEFF]"
+                    : "border-[#E2E8F0] hover:bg-[#F8FAFC]"
+                }`}
+                onClick={() => setSelectedPrefId(p.preference_id)}
+                title={p.seat_code ?? ""}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="text-sm font-medium text-[#0B1220]">
+                    {p.first_name} {p.last_name || ""}
+                  </div>
+                  <div className="text-xs text-[#64748B] flex items-center gap-2">
+                    <span className="font-mono">{p.seat_code ?? "—"}</span>
+                    <Badge className="bg-[#EEF2FF] text-[#1E3A8A] hover:bg-[#EEF2FF]">
+                      {p.tag}
+                    </Badge>
+                  </div>
+                </div>
+              </button>
+            ))}
+            {issuePeople.length === 0 && (
+              <div className="text-sm text-[#64748B] p-2">
+                No rows for this issue.
+              </div>
+            )}
           </div>
         </div>
       </div>

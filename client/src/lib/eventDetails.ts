@@ -71,38 +71,48 @@ export type WarningRow = {
   detail: string;
 };
 
-export function buildWarnings(issues: any): WarningRow[] {
-  const out: WarningRow[] = [];
-  const s = issues?.summary;
-  if (!s) return out;
+export function buildWarnings(issues: any | null) {
+  if (!issues) return [];
+  const out: Array<{
+    id: string;
+    severity: "error" | "warning" | "info";
+    category: string;
+    message: string;
+    detail?: string;
+  }> = [];
 
-  const push = (
-    severity: "error" | "warning" | "info",
-    category: string,
-    message: string,
-    detail: string,
-  ) => {
+  const aisle = Number(issues?.summary?.aisle_mismatches ?? 0);
+  if (aisle > 0) {
     out.push({
-      id: `${category}:${message}`,
-      severity,
-      category,
-      message,
-      detail,
+      id: "aisle-mismatches",
+      severity: "warning",
+      category: "Preferences",
+      message: `${aisle} member(s) want aisle but are not on aisle`,
+      detail: "Open Manual Correction to review swaps.",
     });
-  };
+  }
 
-  const unassignedCnt = Number(s.unassigned ?? 0);
-  const seatConflictsCnt = Number(s.seat_conflicts ?? 0);
-  const blockedCnt = Number(s.blocked_assignments ?? 0);
+  const zone = Number(issues?.summary?.zone_mismatches ?? 0);
+  if (zone > 0) {
+    out.push({
+      id: "zone-mismatches",
+      severity: "warning",
+      category: "Preferences",
+      message: `${zone} member(s) seated outside their preferred zone`,
+      detail: "Consider zone-respecting moves.",
+    });
+  }
 
-  push("warning", "Unassigned", `Unassigned: ${unassignedCnt}`, "");
-  push("warning", "Seat conflicts", `Seat conflicts: ${seatConflictsCnt}`, "");
-  push(
-    "warning",
-    "Blocked assignments",
-    `Blocked assignments: ${blockedCnt}`,
-    "",
-  );
+  const groupsBad = Number(issues?.summary?.groups_not_adjacent ?? 0);
+  if (groupsBad > 0) {
+    out.push({
+      id: "groups-not-adjacent",
+      severity: "warning",
+      category: "Groups",
+      message: `${groupsBad} group(s) not seated contiguously`,
+      detail: "Aim to place each group in a single consecutive seat block.",
+    });
+  }
 
   return out;
 }

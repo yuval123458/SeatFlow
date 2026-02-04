@@ -77,7 +77,6 @@ export default function PortalScreen({ token }: Props) {
     try {
       await submitPortal(token, {
         preferred_zone: form.preferred_zone || null,
-        preferred_seat_code: null,
         wants_aisle: form.wants_aisle ? 1 : 0,
         needs_accessible: form.needs_accessible ? 1 : 0,
         guests: guests.map((g) => ({
@@ -86,7 +85,6 @@ export default function PortalScreen({ token }: Props) {
           phone: g.phone || null,
           gender: g.gender,
           preferred_zone: g.preferred_zone || null,
-          preferred_seat_code: null,
           wants_aisle: g.wants_aisle ? 1 : 0,
           needs_accessible: g.needs_accessible ? 1 : 0,
         })),

@@ -69,7 +69,6 @@ class MemberPreference(Base):
     group_code = Column(String(100), nullable=True)
     wants_aisle = Column(Boolean, nullable=False, server_default=text("0"))
     preferred_zone = Column(String(100), nullable=True)
-    preferred_seat_code = Column(String(50), nullable=True)
     needs_accessible = Column(Boolean, nullable=False, server_default=text("0"))
     invite_token = Column(String(36), nullable=False, unique=True)
 

@@ -3,11 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timezone, date
 from typing import Any, Dict, Tuple, List, Set, Optional
 from sqlalchemy.orm import Session
-from sqlalchemy import func, text
+from sqlalchemy import func, text, bindparam
+from sqlalchemy.exc import OperationalError
 from fastapi import HTTPException, UploadFile
 import csv, re
+import math, time
 from io import StringIO
 from uuid import uuid4
+from collections import Counter, defaultdict
 
 from app import models, schemas
 
@@ -111,38 +114,79 @@ def get_event(db: Session, event_id: int):
 STRICT_THRESH = 0.90 
 
 def _parse_flat_weights(payload: Dict[str, Any]) -> Tuple[Dict[str, float], Dict[str, float]]:
+    # Safe parsing with defaults; group is ignored downstream
     pref_raw = float(payload.get("preference_weight", 50))
-    group_raw = float(payload.get("group_weight", 50))
-    stab_raw  = float(payload.get("stability_weight", 50))
-    for k, v in (("preference_weight", pref_raw), ("group_weight", group_raw), ("stability_weight", stab_raw)):
+    stab_raw = float(payload.get("stability_weight", 50))
+    grp_raw = float(payload.get("group_weight", 0))  # optional in payload
+    for k, v in (("preference_weight", pref_raw), ("stability_weight", stab_raw), ("group_weight", grp_raw)):
         if v < 0 or v > 100:
             raise HTTPException(status_code=400, detail=f"{k} must be between 0 and 100")
     return (
-        {"preference_weight": pref_raw, "group_weight": group_raw, "stability_weight": stab_raw},
-        {"member_preference": pref_raw / 100.0, "group": group_raw / 100.0, "stability": stab_raw / 100.0},
+        {"preference_weight": pref_raw, "stability_weight": stab_raw, "group_weight": grp_raw},
+        {"member_preference": pref_raw / 100.0, "stability": stab_raw / 100.0, "group": 0.0},  # group soft disabled
     )
 
 def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]]):
     payload = payload or {}
-    weights_raw, weights = _parse_flat_weights(payload)
+    _, weights = _parse_flat_weights(payload)
     w_pref = weights["member_preference"]
-    w_group = weights["group"]
-    w_stab  = weights["stability"]
-
+    w_stab = weights["stability"]
+    STRICT_THRESH = 0.90
     strict_member = (w_pref >= STRICT_THRESH)
-    strict_stab   = (w_stab  >= STRICT_THRESH)
+    strict_stab = (w_stab >= STRICT_THRESH)
+    group_adjacency: bool = bool(payload.get("group_adjacency", True))
 
     ev = db.query(models.Event).filter(models.Event.id == event_id).first()
     if not ev:
         raise HTTPException(status_code=404, detail="Event not found")
 
+    # Load seats once (not blocked)
     seats = (
         db.query(models.Seat)
         .filter(models.Seat.venue_id == ev.venue_id, models.Seat.is_blocked != 1)
         .all()
     )
-    seat_by_id = {int(s.id): s for s in seats}
+    if not seats:
+        return {"status": "ok", "weights_used": {"member_preference": w_pref, "stability": w_stab}}
 
+    seat_by_id = {int(s.id): s for s in seats}
+    zone_of_sid: Dict[int, Optional[str]] = {int(s.id): getattr(s, "zone", None) for s in seats}
+
+    # Spatial and row info
+    seat_xy: Dict[int, Tuple[float, float]] = {}
+    try:
+        for s in seats:
+            x = getattr(s, "x", None)
+            y = getattr(s, "y", None)
+            if x is not None and y is not None:
+                seat_xy[int(s.id)] = (float(x), float(y))
+    except Exception:
+        seat_xy = {}
+    has_xy = len(seat_xy) > 0
+
+    row_of_sid: Dict[int, Any] = {}
+    if any(hasattr(s, "row_label") for s in seats):
+        for s in seats:
+            row_of_sid[int(s.id)] = getattr(s, "row_label")
+    elif has_xy:
+        ys_sorted = sorted({pt[1] for pt in seat_xy.values()})
+        bucket = 10.0
+        if len(ys_sorted) >= 2:
+            gaps = [abs(ys_sorted[i+1] - ys_sorted[i]) for i in range(len(ys_sorted)-1)]
+            gaps.sort()
+            med_gap = gaps[len(gaps)//2] if gaps else 1.0
+            bucket = max(1.0, med_gap * 0.6)
+        for sid, (_, y) in seat_xy.items():
+            row_of_sid[int(sid)] = int(round(y / bucket))
+    else:
+        for s in seats:
+            row_of_sid[int(s.id)] = "row-0"
+
+    accessible_seat_ids: Set[int] = {
+        int(s.id) for s in seats if int(getattr(s, "is_accessible", 0) or 0) == 1
+    }
+
+    # Load preferences (with current assignments)
     prefs = (
         db.query(models.MemberPreference)
         .filter(models.MemberPreference.event_id == event_id)
@@ -150,16 +194,25 @@ def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]
         .all()
     )
 
+    # Snapshot previous seats for stability (and current map for diff apply)
     prev_seat_by_pref: Dict[int, Optional[int]] = {
         int(p.id): (int(p.assigned_seat_id) if p.assigned_seat_id else None) for p in prefs
     }
-    for p in prefs:
-        p.assigned_seat_id = None
-    db.flush()
+    has_prev = any(prev_seat_by_pref.values())
+    if not has_prev:
+        w_stab = 0.0
+        strict_stab = False
 
-    warnings: List[Dict[str, Any]] = []
-    used: Set[int] = set()
-    free: Set[int] = {int(s.id) for s in seats if int(getattr(s, "is_blocked", 0) or 0) == 0}
+    curr_assigned_seats: Set[int] = {sid for sid in prev_seat_by_pref.values() if sid is not None}
+    used: Set[int] = set(curr_assigned_seats)
+    free: Set[int] = {int(s.id) for s in seats if int(getattr(s, "is_blocked", 0) or 0) == 0} - used
+    acc_demand_remaining = sum(1 for p in prefs if int(getattr(p, "needs_accessible", 0) or 0) == 1)
+
+    planned: Dict[int, Optional[int]] = {}  # pref_id -> seat_id
+    prefs_by_id: Dict[int, models.MemberPreference] = {int(p.id): p for p in prefs}
+
+    def is_planned(pid: int) -> bool:
+        return pid in planned and planned[pid] is not None
 
     def needs_accessible(p) -> int:
         return int(getattr(p, "needs_accessible", 0) or 0)
@@ -175,93 +228,437 @@ def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]
         reasons: List[str] = []
         pref_zone = getattr(p, "preferred_zone", None)
         wants_aisle = bool(getattr(p, "wants_aisle", 0))
-        pref_seat_code = getattr(p, "preferred_seat_code", None) or getattr(p, "preferred_seat", None)
-
         s_zone = getattr(s, "zone", None)
         s_is_aisle = bool(getattr(s, "is_aisle", 0))
-        s_code = getattr(s, "code", None)
-
-        exact_ok = bool(pref_seat_code and s_code == pref_seat_code)
-        zone_ok  = bool(pref_zone and s_zone == pref_zone)
+        zone_ok = bool(pref_zone and s_zone == pref_zone)
         aisle_ok = (not wants_aisle) or s_is_aisle
-
-        strict_ok = (exact_ok or zone_ok) and aisle_ok  
-
+        strict_ok = ((zone_ok or not pref_zone) and aisle_ok)
         if pref_zone and not zone_ok:
             reasons.append("zone")
-        if pref_seat_code and not exact_ok:
-            reasons.append("seat_code")
         if wants_aisle and not s_is_aisle:
             reasons.append("aisle")
-
         return strict_ok, reasons
 
-    def soft_pick(p, candidate_ids: List[int]) -> int:
-        pref_zone = getattr(p, "preferred_zone", None)
-        wants_aisle = bool(getattr(p, "wants_aisle", 0))
-        prev_sid = prev_seat_by_pref.get(int(p.id))
-        def score(sid: int):
-            s = seat_by_id[sid]
-            z = 1 if pref_zone and getattr(s, "zone", None) == pref_zone else 0
-            a = 1 if (wants_aisle and bool(getattr(s, "is_aisle", 0))) else 0
-            k = 1 if (prev_sid and prev_sid == sid) else 0
-            return (z * w_pref, a * w_pref * 0.5, k * w_stab, -sid)
-        return max(candidate_ids, key=score)
-
-    accessible_seat_ids: Set[int] = {int(s.id) for s in seats if int(getattr(s, "is_accessible", 0) or 0) == 1}
-    acc_demand_remaining = sum(1 for p in prefs if needs_accessible(p) == 1)
-
-    prefs.sort(key=lambda p: (0 if needs_accessible(p) == 1 else 1, int(p.id)))
-
+    # Strict stability: reuse previous seats first
     if strict_stab:
         for p in prefs:
-            if int(p.assigned_seat_id or 0) != 0:
-                continue
-            prev_sid = prev_seat_by_pref.get(int(p.id))
+            pid = int(p.id)
+            prev_sid = prev_seat_by_pref.get(pid)
             if not prev_sid:
                 continue
-            if prev_sid in free:
-                s = seat_by_id[int(prev_sid)]
-                if hard_ok(p, s):
-                    p.assigned_seat_id = int(prev_sid)
+            if prev_sid in free or prev_sid in used:
+                if hard_ok(p, seat_by_id[int(prev_sid)]):
+                    planned[pid] = int(prev_sid)
                     used.add(int(prev_sid))
                     free.discard(int(prev_sid))
                     if needs_accessible(p) == 1:
                         acc_demand_remaining -= 1
 
-    for p in prefs:
-        if int(p.assigned_seat_id or 0) != 0:
-            continue
+    # Groups-first adjacency
+    if group_adjacency:
+        group_members: Dict[str, List[models.MemberPreference]] = defaultdict(list)
+        for p in prefs:
+            g = getattr(p, "group_code", None)
+            if g:
+                group_members[g].append(p)
 
-        candidates = [sid for sid in list(free) if sid not in used and hard_ok(p, seat_by_id[sid])]
+        def row_sort_key(sid: int):
+            s = seat_by_id[sid]
+            sn = getattr(s, "seat_number", None)
+            if sn is not None:
+                try:
+                    return (0, int(sn))
+                except Exception:
+                    return (0, str(sn))
+            if has_xy:
+                return (1, seat_xy.get(int(sid), (0.0, 0.0))[0])
+            return (2, int(sid))
 
-        free_acc_left = len(accessible_seat_ids & free)
-        if needs_accessible(p) == 0 and free_acc_left < acc_demand_remaining:
-            candidates = [sid for sid in candidates if sid not in accessible_seat_ids]
+        def free_rows_by_zone(zone: Optional[str]) -> Dict[Any, List[int]]:
+            rows: Dict[Any, List[int]] = defaultdict(list)
+            for sid in list(free):
+                if sid in used:
+                    continue
+                if zone is not None and zone_of_sid.get(sid) != zone:
+                    continue
+                rows[row_of_sid.get(sid, 0)].append(int(sid))
+            return {rk: sorted(arr, key=row_sort_key) for rk, arr in rows.items() if arr}
 
-        if not candidates:
-            continue
+        def windows_of_size(arr: List[int], k: int) -> List[List[int]]:
+            if k <= 0 or len(arr) < k:
+                return []
+            return [arr[i:i + k] for i in range(0, len(arr) - k + 1)]
 
-        chosen_sid: Optional[int] = None
-        if strict_member:
-            strict_candidates = [sid for sid in candidates if seat_matches_pref(p, seat_by_id[sid])[0]]
-            if not strict_candidates:
-                continue  # strict -> leave unassigned
-            chosen_sid = soft_pick(p, strict_candidates)
-        else:
-            chosen_sid = soft_pick(p, candidates)
+        def choose_group_zone(members: List[models.MemberPreference]) -> Optional[str]:
+            pref_counts = Counter((getattr(m, "preferred_zone", None) or None) for m in members)
+            free_zone_counts = Counter(zone_of_sid[sid] for sid in free if sid not in used)
+            for z, _ in pref_counts.most_common():
+                if z is not None and free_zone_counts.get(z, 0) > 0:
+                    return z
+            if free_zone_counts:
+                return max(free_zone_counts.items(), key=lambda kv: (kv[1], str(kv[0] or "")))[0]
+            return None
 
-        if chosen_sid is not None:
-            p.assigned_seat_id = int(chosen_sid)
+        for gcode, members in sorted(
+            group_members.items(),
+            key=lambda kv: -len([p for p in kv[1] if not is_planned(int(p.id))]),
+        ):
+            unassigned = [p for p in members if not is_planned(int(p.id))]
+            if len(unassigned) < 2:
+                continue
+
+            z0 = choose_group_zone(unassigned)
+            zones_to_try = [z0] if z0 is not None else []
+            zones_to_try += [z for z in sorted(set(zone_of_sid.values())) if z != z0]
+            if not zones_to_try:
+                zones_to_try = [None]
+
+            def mkey(p):
+                return (0 if needs_accessible(p) == 1 else 1,
+                        0 if bool(getattr(p, "wants_aisle", 0)) else 1,
+                        int(p.id))
+            members_sorted = sorted(unassigned, key=mkey)
+            need_acc = sum(1 for p in members_sorted if needs_accessible(p) == 1)
+            want_aisle = sum(1 for p in members_sorted if bool(getattr(p, "wants_aisle", 0)))
+            group_size = len(members_sorted)
+            pref_counts = Counter((getattr(m, "preferred_zone", None) or None) for m in members_sorted)
+            majority_zone = pref_counts.most_common(1)[0][0] if pref_counts else None
+
+            best: Optional[Tuple[Optional[str], Any, List[int], Tuple[int, int, int, int]]] = None
+            for z in zones_to_try:
+                rows_map = free_rows_by_zone(z)
+                if not rows_map:
+                    continue
+                for rk, sids in rows_map.items():
+                    if len(sids) < group_size:
+                        continue
+                    for win in windows_of_size(sids, group_size):
+                        acc_in = sum(1 for sid in win if sid in accessible_seat_ids)
+                        if acc_in < need_acc:
+                            continue
+                        aisle_in = sum(1 for sid in win if bool(getattr(seat_by_id[sid], "is_aisle", 0)))
+                        score = (min(aisle_in, want_aisle), -(acc_in - need_acc), 1 if (z and z == majority_zone) else 0, len(win))
+                        if best is None or score > best[3]:
+                            best = (z, rk, win, score)
+
+            if not best:
+                continue
+
+            _, _, window, _ = best
+            seats_left = list(window)
+            assigned_local: Dict[int, int] = {}
+
+            # 1) Accessible first
+            for p in [m for m in members_sorted if needs_accessible(m) == 1]:
+                if is_planned(int(p.id)):
+                    continue
+                cands = [sid for sid in seats_left if sid in accessible_seat_ids and hard_ok(p, seat_by_id[sid])]
+                if not cands:
+                    assigned_local = {}
+                    break
+                sid = cands[0]
+                assigned_local[int(p.id)] = int(sid)
+                seats_left.remove(int(sid))
+            if not assigned_local and need_acc > 0:
+                continue
+
+            # 2) Aisle wanters
+            for p in [m for m in members_sorted if needs_accessible(m) == 0 and bool(getattr(m, "wants_aisle", 0)) and int(m.id) not in assigned_local]:
+                if is_planned(int(p.id)):
+                    continue
+                cands = [sid for sid in seats_left if bool(getattr(seat_by_id[sid], "is_aisle", 0)) and hard_ok(p, seat_by_id[sid])]
+                if cands:
+                    sid = cands[0]
+                    assigned_local[int(p.id)] = int(sid)
+                    seats_left.remove(int(sid))
+
+            # 3) Rest
+            for p in [m for m in members_sorted if int(m.id) not in assigned_local]:
+                if is_planned(int(p.id)):
+                    continue
+                cands = [sid for sid in seats_left if hard_ok(p, seat_by_id[sid])]
+                if not cands:
+                    assigned_local = {}
+                    break
+                pref_zone = getattr(p, "preferred_zone", None)
+                if pref_zone is not None:
+                    zc = [sid for sid in cands if getattr(seat_by_id[sid], "zone", None) == pref_zone]
+                    if zc:
+                        cands = zc
+                sid = cands[0]
+                assigned_local[int(p.id)] = int(sid)
+                seats_left.remove(int(sid))
+
+            if not assigned_local:
+                continue
+
+            # Plan window
+            for p in members_sorted:
+                pid = int(p.id)
+                sid = assigned_local.get(pid)
+                if sid is None:
+                    continue
+                planned[pid] = int(sid)
+                # release this member's old seat (if moving)
+                old = prev_seat_by_pref.get(pid)
+                if old and int(old) != int(sid):
+                    used.discard(int(old))
+                    free.add(int(old))
+                used.add(int(sid))
+                free.discard(int(sid))
+                if needs_accessible(p) == 1:
+                    acc_demand_remaining -= 1
+
+    # Fill remaining (plan only)
+    remaining = [p for p in prefs if not is_planned(int(p.id))]
+
+    def candidate_list_for(p, allow_use_accessible: bool = False) -> List[int]:
+        c = [sid for sid in list(free) if sid not in used and hard_ok(p, seat_by_id[sid])]
+        # If member has an explicit preferred zone, restrict candidates to that zone first-pass.
+        pref_zone = getattr(p, "preferred_zone", None)
+        if pref_zone:
+            cz = [sid for sid in c if getattr(seat_by_id[sid], "zone", None) == pref_zone]
+            # Use zone-filtered list if any exist; otherwise keep original list (may be empty)
+            if cz:
+                c = cz
+        # keep some accessible capacity unless explicitly allowed
+        if not allow_use_accessible:
+            free_acc_left = len(accessible_seat_ids & free)
+            if needs_accessible(p) == 0 and free_acc_left <= acc_demand_remaining:
+                c = [sid for sid in c if sid not in accessible_seat_ids]
+        return c
+
+    # Use cache only for scarcity ordering
+    cand_cache: Dict[int, int] = {int(p.id): len(candidate_list_for(p)) for p in remaining}
+    remaining_ordered = sorted(remaining, key=lambda p: cand_cache.get(int(p.id), 0))
+
+    # Respect per-member hard rule even if global strict is off
+    def is_member_strict(p) -> bool:
+        # Treat explicit zone preference as strict for zone matching, so we don't ignore requested zones (e.g., VIP)
+        has_explicit_zone = bool((getattr(p, "preferred_zone", None) or "").strip())
+        return bool(
+            getattr(p, "hard_rule", 0)
+            or getattr(p, "has_hard_rule", 0)
+            or getattr(p, "strict", 0)
+            or strict_member
+            or has_explicit_zone
+        )
+    
+    # Dynamic weighting based on current demand/supply in zones and aisle scarcity
+    def compute_dynamic_weights(remaining_members: List[models.MemberPreference], free_seats: Set[int]):
+        # Demand side
+        demand_by_zone: Counter = Counter()
+        want_aisle_count = 0
+        for p in remaining_members:
+            z = getattr(p, "preferred_zone", None)
+            if z is not None and str(z).strip() != "":
+                demand_by_zone[str(z)] += 1
+            if bool(getattr(p, "wants_aisle", 0)):
+                want_aisle_count += 1
+
+        # Supply side
+        free_by_zone: Counter = Counter()
+        free_aisle_count = 0
+        for sid in list(free_seats):
+            z = zone_of_sid.get(int(sid))
+            if z is not None and str(z).strip() != "":
+                free_by_zone[str(z)] += 1
+            if bool(getattr(seat_by_id[int(sid)], "is_aisle", 0)):
+                free_aisle_count += 1
+
+        # Pressure = demand/supply per zone
+        zone_pressure: Dict[str, float] = {}
+        for z, d in demand_by_zone.items():
+            s = max(1, int(free_by_zone.get(z, 0)))
+            zone_pressure[z] = float(d) / float(s)
+        max_zone_pressure = max(zone_pressure.values(), default=1.0)
+
+        # Normalize aisle pressure 0..1 (>=1 means very scarce)
+        aisle_pressure = 0.0
+        if want_aisle_count > 0:
+            aisle_pressure = min(1.0, float(want_aisle_count) / float(max(1, free_aisle_count)))
+
+        # Functions/weights used by the picker
+        def zone_weight_for(z: Optional[str]) -> float:
+            if not z or str(z).strip() == "":
+                return 0.0
+            p = zone_pressure.get(str(z), 0.0)
+            # Scale zone weight by relative scarcity, but guarantee a strong base for any explicit match
+            # so requested zones (e.g., VIP) are preferred even if supply is abundant.
+            rel = 0.0 if max_zone_pressure <= 0 else (p / max_zone_pressure)
+            return float(w_pref) * (0.7 + 0.3 * max(0.0, min(1.0, rel)))
+
+        aisle_weight = float(w_pref) * aisle_pressure  # emphasize when scarce
+        stability_weight = float(w_stab)
+
+        # Seat popularity penalty (0..1): discourage highly coveted seats so others can still match
+        popularity: Dict[int, float] = {}
+        for sid in list(free_seats):
+            z = zone_of_sid.get(int(sid))
+            zp = zone_pressure.get(str(z), 0.0) if z is not None else 0.0
+            # Convert pressure to 0..1 via p/(1+p)
+            z_term = zp / (1.0 + zp)
+            a_flag = 1.0 if bool(getattr(seat_by_id[int(sid)], "is_aisle", 0)) else 0.0
+            a_term = a_flag * aisle_pressure
+            popularity[int(sid)] = max(0.0, min(1.0, 0.7 * z_term + 0.3 * a_term))
+
+        return {
+            "zone_weight_for": zone_weight_for,
+            "aisle_weight": aisle_weight,
+            "stability_weight": stability_weight,
+            "popularity": popularity,
+        }
+
+    dynw = compute_dynamic_weights(remaining, free)
+
+    def soft_pick_v2(p, candidate_ids: List[int], dynw) -> Optional[int]:
+        if not candidate_ids:
+            return None
+        pref_zone = getattr(p, "preferred_zone", None)
+        wants_aisle = bool(getattr(p, "wants_aisle", 0))
+        prev_sid = prev_seat_by_pref.get(int(p.id))
+
+        def score(sid: int):
+            s = seat_by_id[sid]
+            z_match = 1 if (pref_zone and getattr(s, "zone", None) == pref_zone) else 0
+            a_match = 1 if (wants_aisle and bool(getattr(s, "is_aisle", 0))) else 0
+            keep = 1 if (prev_sid and prev_sid == sid) else 0
+            w_zone = dynw["zone_weight_for"](pref_zone) if pref_zone else 0.0
+            w_aisle = dynw["aisle_weight"]
+            w_stb = dynw["stability_weight"]
+            pop_pen = 0.15 * dynw["popularity"].get(sid, 0.0)
+            return (z_match * w_zone + a_match * w_aisle + keep * w_stb - pop_pen, -int(sid))
+
+        return max(candidate_ids, key=score)
+
+    def pick_nonconflicting(p, candidates: List[int], dynw) -> Optional[int]:
+        # Try best-scored seats, skipping ones already taken
+        pool = list(dict.fromkeys(candidates))  # dedupe, keep order
+        while pool:
+            sid = soft_pick_v2(p, pool, dynw)
+            if sid is None:
+                return None
+            if sid not in used:
+                return sid
+            try:
+                pool.remove(sid)
+            except ValueError:
+                break
+        return None
+
+    # Make multiple passes while assignments are still happening
+    while True:
+        progress = False
+        # Recompute dynamic weights each pass to reflect updated free seats and remaining members
+        unplanned_now = [pp for pp in prefs if not is_planned(int(pp.id))]
+        dynw = compute_dynamic_weights(unplanned_now, free)
+        for p in remaining_ordered:
+            pid = int(p.id)
+            if is_planned(pid):
+                continue
+            candidates = candidate_list_for(p)
+            if not candidates:
+                continue
+            cand2 = candidates
+            if is_member_strict(p):
+                cand2 = [sid for sid in cand2 if seat_matches_pref(p, seat_by_id[sid])[0]]
+                if not cand2:
+                    continue
+            chosen_sid = pick_nonconflicting(p, cand2, dynw)
+            if chosen_sid is None:
+                continue
+            planned[pid] = int(chosen_sid)
+            # release this member's old seat (if moving)
+            old = prev_seat_by_pref.get(pid)
+            if old and int(old) != int(chosen_sid):
+                used.discard(int(old))
+                free.add(int(old))
             used.add(int(chosen_sid))
             free.discard(int(chosen_sid))
             if needs_accessible(p) == 1:
                 acc_demand_remaining -= 1
+            progress = True
+        if not progress:
+            break
+
+    # Final greedy fallback: allow using accessible seats and relax soft prefs
+    leftovers = [p for p in prefs if planned.get(int(p.id)) is None]
+    if leftovers:
+        for p in leftovers:
+            pid = int(p.id)
+            cands = candidate_list_for(p, allow_use_accessible=True)  # LIVE recompute
+            if not cands:
+                continue
+            if is_member_strict(p):
+                soft_ok = [sid for sid in cands if seat_matches_pref(p, seat_by_id[sid])[0]]
+                if soft_ok:
+                    cands = soft_ok
+            sid = pick_nonconflicting(p, cands, dynw)
+            if sid is None:
+                continue
+            planned[pid] = int(sid)
+            old = prev_seat_by_pref.get(pid)
+            if old and int(old) != int(sid):
+                used.discard(int(old))
+                free.add(int(old))
+            used.add(int(sid))
+            free.discard(int(sid))
+            if needs_accessible(p) == 1:
+                acc_demand_remaining -= 1
+
+    # Final safety: resolve any duplicate seats inside plan
+    assigned_by_seat: Dict[int, int] = {}
+    dup_holders: List[int] = []
+    for pid, sid in planned.items():
+        if sid is None:
+            continue
+        if sid in assigned_by_seat:
+            dup_holders.append(pid)
+        else:
+            assigned_by_seat[sid] = pid
+
+    if dup_holders:
+        still_assigned = {sid for sid in assigned_by_seat.keys()}
+        free_pool = ({int(sid) for sid in seat_by_id.keys()} - still_assigned)
+        for pid in dup_holders:
+            p = prefs_by_id[pid]
+            planned[pid] = None
+            cands = [sid for sid in free_pool if hard_ok(p, seat_by_id[sid])]
+            if strict_member:
+                cands = [sid for sid in cands if seat_matches_pref(p, seat_by_id[sid])[0]]
+            sid = pick_nonconflicting(p, cands, dynw) if cands else None
+            if sid is not None:
+                planned[pid] = int(sid)
+                # release old seat on move
+                old = prev_seat_by_pref.get(pid)
+                if old and int(old) != int(sid):
+                    used.discard(int(old))
+                    free_pool.add(int(old))
+                free_pool.discard(int(sid))
+
+    curr = prev_seat_by_pref
+    ids_change: List[int] = [pid for pid in curr.keys() if (curr.get(pid) or None) != (planned.get(pid) or None)]
+    to_set: List[Tuple[int, int]] = [(pid, int(sid)) for pid, sid in planned.items() if sid is not None and pid in ids_change]
+
+    if ids_change:
+        db.execute(
+            text("UPDATE member_preferences SET assigned_seat_id = NULL WHERE event_id = :eid AND id IN :ids")
+            .bindparams(bindparam("ids", expanding=True)),
+            {"eid": event_id, "ids": ids_change},
+        )
+
+    if to_set:
+        db.execute(
+            text("UPDATE member_preferences SET assigned_seat_id = :sid WHERE event_id = :eid AND id = :pid"),
+            [{"eid": event_id, "pid": int(pid), "sid": int(sid)} for pid, sid in to_set],
+        )
 
     db.commit()
+
     return {
         "status": "ok",
-        "weights_used": weights,  
+        "weights_used": {"member_preference": w_pref, "stability": w_stab},
+        "group_adjacency": group_adjacency,
     }
 
 
@@ -346,6 +743,7 @@ def event_issues(db: Session, event_id: int):
     if not ev:
         raise HTTPException(status_code=404, detail="Event not found")
 
+    # Seat conflicts (same seat to >1)
     conflict_rows = (
         db.query(
             models.MemberPreference.assigned_seat_id.label("seat_id"),
@@ -365,8 +763,13 @@ def event_issues(db: Session, event_id: int):
         if r.seat_id is not None
     ]
 
+    # Blocked seats assigned
     blocked_rows = (
-        db.query(models.MemberPreference.id, models.MemberPreference.assigned_seat_id, models.Seat.code)
+        db.query(
+            models.MemberPreference.id,
+            models.MemberPreference.assigned_seat_id,
+            models.Seat.code,
+        )
         .join(models.Seat, models.Seat.id == models.MemberPreference.assigned_seat_id)
         .filter(
             models.MemberPreference.event_id == event_id,
@@ -381,8 +784,13 @@ def event_issues(db: Session, event_id: int):
         if sid is not None
     ]
 
+    # Accessibility violations
     acc_rows = (
-        db.query(models.MemberPreference.id, models.MemberPreference.assigned_seat_id, models.Seat.code)
+        db.query(
+            models.MemberPreference.id,
+            models.MemberPreference.assigned_seat_id,
+            models.Seat.code,
+        )
         .join(models.Seat, models.Seat.id == models.MemberPreference.assigned_seat_id)
         .filter(
             models.MemberPreference.event_id == event_id,
@@ -398,6 +806,7 @@ def event_issues(db: Session, event_id: int):
         if sid is not None
     ]
 
+    # Unassigned (names optional; participants panel already lists them)
     unassigned_rows = (
         db.query(models.MemberPreference.id, models.MemberPreference.member_id)
         .filter(
@@ -408,17 +817,188 @@ def event_issues(db: Session, event_id: int):
     )
     unassigned = [{"preference_id": int(pid), "member_id": int(mid)} for pid, mid in unassigned_rows]
 
+    # Assigned with seat + member (no row_index/seat_index usage)
+    assigned = (
+        db.query(
+            models.MemberPreference.id.label("preference_id"),
+            models.MemberPreference.member_id,
+            models.MemberPreference.group_code,
+            models.MemberPreference.wants_aisle,
+            models.MemberPreference.preferred_zone,
+            models.Seat.id.label("seat_id"),
+            models.Seat.code.label("seat_code"),
+            models.Seat.zone.label("seat_zone"),
+            models.Seat.is_aisle.label("seat_is_aisle"),
+            models.Seat.x.label("x"),
+            models.Seat.y.label("y"),
+            models.Member.first_name,
+            models.Member.last_name,
+        )
+        .join(models.Seat, models.Seat.id == models.MemberPreference.assigned_seat_id)
+        .join(models.Member, models.Member.id == models.MemberPreference.member_id, isouter=True)
+        .filter(
+            models.MemberPreference.event_id == event_id,
+            models.MemberPreference.assigned_seat_id.isnot(None),
+        )
+        .all()
+    )
+
+    # Aisle mismatches
+    aisle_mismatches = []
+    for r in assigned:
+        wants = 1 if (getattr(r, "wants_aisle", 0) or 0) == 1 else 0
+        is_aisle = 1 if (getattr(r, "seat_is_aisle", 0) or 0) == 1 else 0
+        if wants == 1 and is_aisle == 0:
+            aisle_mismatches.append({
+                "preference_id": int(r.preference_id),
+                "member_id": int(r.member_id),
+                "first_name": getattr(r, "first_name", "") or "",
+                "last_name": getattr(r, "last_name", "") or "",
+                "seat_id": int(r.seat_id),
+                "seat_code": getattr(r, "seat_code", None),
+                "zone": getattr(r, "seat_zone", None),
+            })
+
+    # Zone preference not met
+    zone_mismatches = []
+    for r in assigned:
+        pref_zone = getattr(r, "preferred_zone", None)
+        seat_zone = getattr(r, "seat_zone", None)
+        if pref_zone and seat_zone and str(pref_zone) != str(seat_zone):
+            zone_mismatches.append({
+                "preference_id": int(r.preference_id),
+                "member_id": int(r.member_id),
+                "first_name": getattr(r, "first_name", "") or "",
+                "last_name": getattr(r, "last_name", "") or "",
+                "seat_id": int(r.seat_id),
+                "seat_code": getattr(r, "seat_code", None),
+                "preferred_zone": pref_zone,
+                "actual_zone": seat_zone,
+            })
+
+    # Build row indexing using Seat.y (bucketed) and Seat.x ordering
+    # Prefer all seats for the event; if Seat.event_id is absent, fall back to seats used by this event.
+    try:
+        seats_all = (
+            db.query(models.Seat.id, models.Seat.x, models.Seat.y)
+            .filter(models.Seat.event_id == event_id)
+            .all()
+        )
+    except Exception:
+        seats_all = (
+            db.query(models.Seat.id, models.Seat.x, models.Seat.y)
+            .join(models.MemberPreference, models.MemberPreference.assigned_seat_id == models.Seat.id)
+            .filter(models.MemberPreference.event_id == event_id)
+            .all()
+        )
+
+    ROW_EPS = 1.0  # tweak if your row Y spacing is < 1 unit
+
+    def row_key_from_y(y):
+        if y is None:
+            return None
+        return round(float(y) / ROW_EPS) * ROW_EPS
+
+    rows_all: dict[float, list[tuple[float, int]]] = defaultdict(list)
+    for sid, sx, sy in seats_all:
+        rk = row_key_from_y(sy)
+        if rk is not None and sx is not None:
+            rows_all[rk].append((float(sx), int(sid)))
+
+    row_index_of: dict[int, int] = {}
+    for rk, items in rows_all.items():
+        items.sort(key=lambda t: t[0])  # left-to-right
+        for idx, (_x, sid) in enumerate(items):
+            row_index_of[sid] = idx
+
+    # Groups not seated contiguously:
+    # Rule: all members must be on the same row (by Y bucket) AND their seat indices form a single consecutive block.
+    by_group: dict[str, list] = defaultdict(list)
+    for r in assigned:
+        g = getattr(r, "group_code", None)
+        if g:
+            by_group[str(g)].append(r)
+
+    group_not_adjacent_members: list[dict] = []
+
+    for gcode, members in by_group.items():
+        if len(members) < 2:
+            continue
+
+        rk_vals = {row_key_from_y(getattr(m, "y", None)) for m in members}
+        rk_vals = {rk for rk in rk_vals if rk is not None}
+        if len(rk_vals) != 1:
+            # Not on one row -> not contiguous
+            group_not_adjacent_members += [
+                {
+                    "group_code": gcode,
+                    "preference_id": int(m.preference_id),
+                    "member_id": int(m.member_id),
+                    "first_name": getattr(m, "first_name", "") or "",
+                    "last_name": getattr(m, "last_name", "") or "",
+                    "seat_id": int(m.seat_id),
+                    "seat_code": getattr(m, "seat_code", None),
+                }
+                for m in members
+            ]
+            continue
+
+        indices: list[int] = []
+        missing = False
+        for m in members:
+            idx = row_index_of.get(int(m.seat_id))
+            if idx is None:
+                missing = True
+                break
+            indices.append(idx)
+        if missing:
+            group_not_adjacent_members += [
+                {
+                    "group_code": gcode,
+                    "preference_id": int(m.preference_id),
+                    "member_id": int(m.member_id),
+                    "first_name": getattr(m, "first_name", "") or "",
+                    "last_name": getattr(m, "last_name", "") or "",
+                    "seat_id": int(m.seat_id),
+                    "seat_code": getattr(m, "seat_code", None),
+                }
+                for m in members
+            ]
+            continue
+
+        indices.sort()
+        contiguous = indices[-1] - indices[0] + 1 == len(indices)
+        if not contiguous:
+            group_not_adjacent_members += [
+                {
+                    "group_code": gcode,
+                    "preference_id": int(m.preference_id),
+                    "member_id": int(m.member_id),
+                    "first_name": getattr(m, "first_name", "") or "",
+                    "last_name": getattr(m, "last_name", "") or "",
+                    "seat_id": int(m.seat_id),
+                    "seat_code": getattr(m, "seat_code", None),
+                }
+                for m in members
+            ]
+
     return {
         "summary": {
             "seat_conflicts": len(seat_conflicts),
             "blocked_assignments": len(blocked_assignments),
             "accessibility_violations": len(accessibility_violations),
             "unassigned": len(unassigned),
+            "aisle_mismatches": len(aisle_mismatches),
+            "zone_mismatches": len(zone_mismatches),
+            "groups_not_adjacent": len({m["group_code"] for m in group_not_adjacent_members}) if group_not_adjacent_members else 0,
         },
         "seat_conflicts": seat_conflicts,
         "blocked_assignments": blocked_assignments,
         "accessibility_violations": accessibility_violations,
         "unassigned": unassigned,
+        "aisle_mismatches": aisle_mismatches,
+        "zone_mismatches": zone_mismatches,
+        "group_not_adjacent_members": group_not_adjacent_members,
     }
 
 
