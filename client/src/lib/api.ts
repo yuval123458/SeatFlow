@@ -34,12 +34,12 @@ export async function apiPost(
     method: "POST",
     headers: isForm
       ? {
-          ...authHeaders(), // NEW
+          ...authHeaders(),
           ...(init?.headers as any),
         }
       : {
           "Content-Type": "application/json",
-          ...authHeaders(), // NEW
+          ...authHeaders(),
           ...(init?.headers as any),
         },
     body: isForm
@@ -63,7 +63,7 @@ export const runAssignments = (id: string | number, payload?: any) =>
     method: "POST",
     headers: payload
       ? { "Content-Type": "application/json", ...authHeaders() } // NEW
-      : { ...authHeaders() }, // NEW
+      : { ...authHeaders() },
     body: payload ? JSON.stringify(payload) : undefined,
   }).then((r) => {
     if (!r.ok) throw new Error("run failed");
@@ -91,7 +91,7 @@ export const moveAssignment = (
     `${API_BASE}/events/${id}/assignments/move?preference_id=${preferenceId}&seat_id=${seatId}`,
     {
       method: "POST",
-      headers: { ...authHeaders() }, // NEW
+      headers: { ...authHeaders() },
     },
   ).then((r) => {
     if (!r.ok) throw new Error("move failed");
@@ -102,7 +102,7 @@ export const clearAssignment = (id: string | number, preferenceId: number) =>
     `${API_BASE}/events/${id}/assignments/clear?preference_id=${preferenceId}`,
     {
       method: "POST",
-      headers: { ...authHeaders() }, // NEW
+      headers: { ...authHeaders() },
     },
   ).then((r) => {
     if (!r.ok) throw new Error("clear failed");
@@ -120,9 +120,7 @@ export const importEventMembers = (
   const fd = new FormData();
   fd.append("file", file);
   const qs = opts?.dryRun ? "?dry_run=1" : "";
-  return apiPost(`/events/${eventId}/members/import${qs}`, fd, {
-    headers: undefined,
-  });
+  return apiPost(`/events/${eventId}/members/import${qs}`, fd);
 };
 
 export async function createVenue(payload: {
@@ -163,7 +161,7 @@ export async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: {
       "Content-Type": "application/json",
-      ...authHeaders(), // NEW
+      ...authHeaders(),
       ...(init?.headers || {}),
     },
   });
@@ -231,7 +229,7 @@ export type SeatMapSeat = {
 export async function getVenueSeatMap(venueId: number): Promise<SeatMapSeat[]> {
   const res = await fetch(`${API_BASE}/venues/${venueId}/seatmap`, {
     method: "GET",
-    headers: { ...authHeaders() }, // NEW
+    headers: { ...authHeaders() },
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");

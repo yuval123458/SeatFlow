@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends, Body, Query
+from fastapi import APIRouter, Depends, Body, Query, UploadFile, File, Query
 from sqlalchemy.orm import Session
 from typing import Optional, Dict, Any
+
 
 from app.db import get_db
 from app import models, schemas
@@ -79,3 +80,19 @@ def update_event_status(
     user: models.User = Depends(get_current_user),
 ):
     return events_service.update_event_status(db, event_id, payload)
+
+
+@router.post("/events/{event_id}/members/import")
+async def import_event_members_csv(
+    event_id: int,
+    file: UploadFile = File(...),
+    dry_run: int = Query(0),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    return await events_service.import_event_members_csv(
+        db=db,
+        event_id=event_id,
+        upload=file,
+        dry_run=bool(dry_run),
+    )

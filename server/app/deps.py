@@ -2,11 +2,13 @@ import os
 from fastapi import Depends, HTTPException, Request
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
+from app.settings import settings
+
 
 from app.db import get_db
 from app import models
 
-JWT_SECRET = os.getenv("JWT_SECRET", "dev-insecure-change-me")
+JWT_SECRET = settings.JWT_SECRET
 JWT_ALG = os.getenv("JWT_ALG", "HS256")
 
 

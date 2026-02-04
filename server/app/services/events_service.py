@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any
-
-from fastapi import HTTPException
+from datetime import datetime, timezone, date
+from typing import Any, Dict, Tuple, List, Set, Optional
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, text
+# ADD:
+from fastapi import HTTPException, UploadFile
+import csv, re
+from io import StringIO
+from uuid import uuid4
 
 from app import models, schemas
 
@@ -106,42 +109,40 @@ def get_event(db: Session, event_id: int):
     }
 
 
+STRICT_THRESH = 0.90 
+
+def _parse_flat_weights(payload: Dict[str, Any]) -> Tuple[Dict[str, float], Dict[str, float]]:
+    pref_raw = float(payload.get("preference_weight", 50))
+    group_raw = float(payload.get("group_weight", 50))
+    stab_raw  = float(payload.get("stability_weight", 50))
+    for k, v in (("preference_weight", pref_raw), ("group_weight", group_raw), ("stability_weight", stab_raw)):
+        if v < 0 or v > 100:
+            raise HTTPException(status_code=400, detail=f"{k} must be between 0 and 100")
+    return (
+        {"preference_weight": pref_raw, "group_weight": group_raw, "stability_weight": stab_raw},
+        {"member_preference": pref_raw / 100.0, "group": group_raw / 100.0, "stability": stab_raw / 100.0},
+    )
+
 def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]]):
+    payload = payload or {}
+    weights_raw, weights = _parse_flat_weights(payload)
+    w_pref = weights["member_preference"]
+    w_group = weights["group"]
+    w_stab  = weights["stability"]
+
+    strict_member = (w_pref >= STRICT_THRESH)
+    strict_stab   = (w_stab  >= STRICT_THRESH)
+
     ev = db.query(models.Event).filter(models.Event.id == event_id).first()
     if not ev:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    payload = payload or {}
-
-    def _weight(*keys: str, default: float) -> float:
-        for k in keys:
-            v = payload.get(k)
-            if v is None:
-                continue
-            try:
-                vv = float(v)
-                if vv < 0:
-                    vv = 0.0
-                if vv > 100:
-                    vv = 100.0
-                return vv / 100.0
-            except Exception:
-                pass
-        return default / 100.0
-
-    w_pref = _weight("preference_weight", "preferenceWeight", default=60)
-    w_group = _weight("group_weight", "groupWeight", default=70)
-    w_stable = _weight("stability_weight", "stabilityWeight", default=80)
-
     seats = (
         db.query(models.Seat)
-        .filter(
-            models.Seat.venue_id == ev.venue_id,
-            models.Seat.is_blocked != 1,
-        )
+        .filter(models.Seat.venue_id == ev.venue_id, models.Seat.is_blocked != 1)
         .all()
     )
-    seat_by_id = {s.id: s for s in seats}
+    seat_by_id = {int(s.id): s for s in seats}
 
     prefs = (
         db.query(models.MemberPreference)
@@ -150,8 +151,19 @@ def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]
         .all()
     )
 
+    prev_seat_by_pref: Dict[int, Optional[int]] = {
+        int(p.id): (int(p.assigned_seat_id) if p.assigned_seat_id else None) for p in prefs
+    }
+    for p in prefs:
+        p.assigned_seat_id = None
+    db.flush()
+
+    warnings: List[Dict[str, Any]] = []
+    used: Set[int] = set()
+    free: Set[int] = {int(s.id) for s in seats if int(getattr(s, "is_blocked", 0) or 0) == 0}
+
     def needs_accessible(p) -> int:
-        return int(bool(getattr(p, "needs_accessible", 0)))
+        return int(getattr(p, "needs_accessible", 0) or 0)
 
     def hard_ok(p, s) -> bool:
         if int(getattr(s, "is_blocked", 0) or 0) == 1:
@@ -160,120 +172,97 @@ def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]
             return False
         return True
 
-    prev_seat_by_pref: Dict[int, Optional[int]] = {
-        int(p.id): (int(p.assigned_seat_id) if p.assigned_seat_id else None) for p in prefs
-    }
+    def seat_matches_pref(p, s) -> Tuple[bool, List[str]]:
+        reasons: List[str] = []
+        pref_zone = getattr(p, "preferred_zone", None)
+        wants_aisle = bool(getattr(p, "wants_aisle", 0))
+        pref_seat_code = getattr(p, "preferred_seat_code", None) or getattr(p, "preferred_seat", None)
 
-    for p in prefs:
-        p.assigned_seat_id = None
+        s_zone = getattr(s, "zone", None)
+        s_is_aisle = bool(getattr(s, "is_aisle", 0))
+        s_code = getattr(s, "code", None)
 
-    free_ids = {s.id for s in seats}
-    group_points: Dict[str, list[tuple[float, float]]] = {}
+        exact_ok = bool(pref_seat_code and s_code == pref_seat_code)
+        zone_ok  = bool(pref_zone and s_zone == pref_zone)
+        aisle_ok = (not wants_aisle) or s_is_aisle
 
-    xs = [float(s.x) for s in seats if getattr(s, "x", None) is not None]
-    ys = [float(s.y) for s in seats if getattr(s, "y", None) is not None]
-    if xs and ys:
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
-        max_dist = ((max_x - min_x) ** 2 + (max_y - min_y) ** 2) ** 0.5
-        if max_dist <= 0:
-            max_dist = 1.0
-    else:
-        max_dist = 1.0
+        strict_ok = (exact_ok or zone_ok) and aisle_ok  
 
-    def _add_group_point(p, seat_id: int) -> None:
-        gc = getattr(p, "group_code", None)
-        if not gc:
-            return
-        s = seat_by_id.get(seat_id)
-        if not s:
-            return
-        if getattr(s, "x", None) is None or getattr(s, "y", None) is None:
-            return
-        group_points.setdefault(str(gc), []).append((float(s.x), float(s.y)))
+        if pref_zone and not zone_ok:
+            reasons.append("zone")
+        if pref_seat_code and not exact_ok:
+            reasons.append("seat_code")
+        if wants_aisle and not s_is_aisle:
+            reasons.append("aisle")
 
-    def preference_score(p, s) -> float:
-        score = 0.0
-        if getattr(p, "preferred_seat_code", None) and s.code == p.preferred_seat_code:
-            score += 1.0
-        if getattr(p, "preferred_zone", None) and getattr(s, "zone", None) == p.preferred_zone:
-            score += 0.5
-        if int(getattr(p, "wants_aisle", 0) or 0) == 1 and int(getattr(s, "is_aisle", 0) or 0) == 1:
-            score += 0.2
-        return 1.0 if score >= 1.0 else score
+        return strict_ok, reasons
 
-    def group_score(p, s) -> float:
-        gc = getattr(p, "group_code", None)
-        if not gc:
-            return 0.0
-        pts = group_points.get(str(gc))
-        if not pts:
-            return 0.0
-        if getattr(s, "x", None) is None or getattr(s, "y", None) is None:
-            return 0.0
-        cx = sum(px for px, _ in pts) / len(pts)
-        cy = sum(py for _, py in pts) / len(pts)
-        dx = float(s.x) - cx
-        dy = float(s.y) - cy
-        dist = (dx * dx + dy * dy) ** 0.5
-        norm = dist / max_dist
-        if norm < 0:
-            norm = 0.0
-        if norm > 1:
-            norm = 1.0
-        return 1.0 - norm
-
-    def stability_score(p, s) -> float:
-        return 1.0 if prev_seat_by_pref.get(int(p.id)) == int(s.id) else 0.0
-
-    def total_score(p, s) -> float:
-        return (
-            w_pref * preference_score(p, s)
-            + w_group * group_score(p, s)
-            + w_stable * stability_score(p, s)
-        )
-
-    def assign_best(p) -> None:
-        if p.assigned_seat_id:
-            return
-
-        best_sid: Optional[int] = None
-        best_sc: Optional[float] = None
-
-        for sid in sorted(free_ids):
+    def soft_pick(p, candidate_ids: List[int]) -> int:
+        pref_zone = getattr(p, "preferred_zone", None)
+        wants_aisle = bool(getattr(p, "wants_aisle", 0))
+        prev_sid = prev_seat_by_pref.get(int(p.id))
+        def score(sid: int):
             s = seat_by_id[sid]
-            if not hard_ok(p, s):
+            z = 1 if pref_zone and getattr(s, "zone", None) == pref_zone else 0
+            a = 1 if (wants_aisle and bool(getattr(s, "is_aisle", 0))) else 0
+            k = 1 if (prev_sid and prev_sid == sid) else 0
+            return (z * w_pref, a * w_pref * 0.5, k * w_stab, -sid)
+        return max(candidate_ids, key=score)
+
+    accessible_seat_ids: Set[int] = {int(s.id) for s in seats if int(getattr(s, "is_accessible", 0) or 0) == 1}
+    acc_demand_remaining = sum(1 for p in prefs if needs_accessible(p) == 1)
+
+    prefs.sort(key=lambda p: (0 if needs_accessible(p) == 1 else 1, int(p.id)))
+
+    if strict_stab:
+        for p in prefs:
+            if int(p.assigned_seat_id or 0) != 0:
                 continue
-            sc = total_score(p, s)
-            if best_sc is None or sc > best_sc or (sc == best_sc and sid < (best_sid or sid)):
-                best_sc = sc
-                best_sid = sid
-
-        if best_sid is not None:
-            p.assigned_seat_id = best_sid
-            free_ids.remove(best_sid)
-            _add_group_point(p, best_sid)
+            prev_sid = prev_seat_by_pref.get(int(p.id))
+            if not prev_sid:
+                continue
+            if prev_sid in free:
+                s = seat_by_id[int(prev_sid)]
+                if hard_ok(p, s):
+                    p.assigned_seat_id = int(prev_sid)
+                    used.add(int(prev_sid))
+                    free.discard(int(prev_sid))
+                    if needs_accessible(p) == 1:
+                        acc_demand_remaining -= 1
 
     for p in prefs:
-        if needs_accessible(p) == 1:
-            assign_best(p)
-    for p in prefs:
-        if not p.assigned_seat_id:
-            assign_best(p)
+        if int(p.assigned_seat_id or 0) != 0:
+            continue
+
+        candidates = [sid for sid in list(free) if sid not in used and hard_ok(p, seat_by_id[sid])]
+
+        free_acc_left = len(accessible_seat_ids & free)
+        if needs_accessible(p) == 0 and free_acc_left < acc_demand_remaining:
+            candidates = [sid for sid in candidates if sid not in accessible_seat_ids]
+
+        if not candidates:
+            continue
+
+        chosen_sid: Optional[int] = None
+        if strict_member:
+            strict_candidates = [sid for sid in candidates if seat_matches_pref(p, seat_by_id[sid])[0]]
+            if not strict_candidates:
+                continue  # strict -> leave unassigned
+            chosen_sid = soft_pick(p, strict_candidates)
+        else:
+            chosen_sid = soft_pick(p, candidates)
+
+        if chosen_sid is not None:
+            p.assigned_seat_id = int(chosen_sid)
+            used.add(int(chosen_sid))
+            free.discard(int(chosen_sid))
+            if needs_accessible(p) == 1:
+                acc_demand_remaining -= 1
 
     db.commit()
-    total = len(prefs)
-    assigned = sum(1 for p in prefs if p.assigned_seat_id)
     return {
-        "event_id": event_id,
-        "assigned": assigned,
-        "total": total,
-        "unassigned": total - assigned,
-        "weights": {
-            "preference_weight": int(round(w_pref * 100)),
-            "group_weight": int(round(w_group * 100)),
-            "stability_weight": int(round(w_stable * 100)),
-        },
+        "status": "ok",
+        "weights_used": weights,  
     }
 
 
@@ -464,9 +453,6 @@ def move_assignment(db: Session, event_id: int, preference_id: int, seat_id: int
     if int(getattr(seat, "is_blocked", 0) or 0) == 1:
         raise HTTPException(status_code=400, detail="Seat is blocked")
 
-    if int(getattr(pref, "needs_accessible", 0) or 0) == 1 and int(getattr(seat, "is_accessible", 0) or 0) != 1:
-        raise HTTPException(status_code=400, detail="Member requires an accessible seat")
-
     taken = (
         db.query(models.MemberPreference)
         .filter(
@@ -532,4 +518,137 @@ def update_event_status(db: Session, event_id: int, payload: schemas.EventStatus
         "attendees_count": int(total_prefs),
         "assigned_count": int(assigned_count),
         "total_prefs": int(total_prefs),
+    }
+
+
+# ---- CSV import helpers ----
+_REQUIRED = {"first_name", "last_name", "gender", "phone", "birth_date"}
+
+def _sniff_delimiter(text: str) -> str:
+    sample = text[:4096]
+    counts = {d: sample.count(d) for d in [",", "\t", ";"]}
+    best = max(counts, key=counts.get)
+    return best if counts[best] > 0 else ","
+
+def _normalize_headers(fieldnames: list[str] | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for h in (fieldnames or []):
+        norm = re.sub(r"[\s\-]+", "_", (h or "").strip().lower())
+        out[norm] = h
+    return out
+
+def _parse_birth_date(val: str | None) -> date | None:
+    if not val or not str(val).strip():
+        return None
+    s = str(val).strip()
+    try:
+        return date.fromisoformat(s) 
+    except Exception:
+        pass
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            continue
+    raise ValueError("birth_date must be YYYY-MM-DD (or DD/MM/YYYY)")
+
+def _norm_gender(val: str | None) -> str:
+    s = (val or "").strip().lower()
+    if s in {"male", "m"}:
+        return "male"
+    if s in {"female", "f"}:
+        return "female"
+    raise ValueError("gender must be 'male' or 'female'")
+
+async def import_event_members_csv(db: Session, event_id: int, upload: UploadFile, dry_run: bool):
+    ev = db.query(models.Event).filter(models.Event.id == event_id).first()
+    if not ev:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    raw = await upload.read()
+    text = raw.decode("utf-8-sig", errors="replace")
+
+    delim = _sniff_delimiter(text)
+    reader = csv.DictReader(StringIO(text), delimiter=delim)
+
+    header_map = _normalize_headers(reader.fieldnames)
+    missing = sorted(list(_REQUIRED - set(header_map.keys())))
+    if missing:
+        resp = {
+            "ok": False,
+            "dry_run": True,
+            "created_members": 0,
+            "preferences_created": 0,
+            "preferences_updated": 0,
+            "errors": [{"row": 1, "error": f"Missing required columns: {missing}"}],
+        }
+        if dry_run:
+            return resp
+        raise HTTPException(status_code=400, detail=resp)
+
+    errors: list[dict] = []
+    valid: list[dict] = []
+
+    for idx, row in enumerate(reader, start=2):
+        try:
+            first = (row.get(header_map["first_name"]) or "").strip()
+            last = (row.get(header_map["last_name"]) or "").strip()
+            if not first or not last:
+                raise ValueError("first_name and last_name are required")
+            gender = _norm_gender(row.get(header_map["gender"]))
+            phone = (row.get(header_map["phone"]) or "").strip() or None
+            bd = _parse_birth_date(row.get(header_map["birth_date"]))
+            valid.append({
+                "first_name": first,
+                "last_name": last,
+                "gender": gender,
+                "phone": phone,
+                "birth_date": bd,
+            })
+        except Exception as e:
+            errors.append({"row": idx, "error": str(e)})
+
+    if dry_run:
+        return {
+            "ok": (len(errors) == 0),
+            "dry_run": True,
+            "created_members": len(valid),
+            "preferences_created": 0,
+            "preferences_updated": 0,
+            "errors": errors[:200],
+        }
+
+    if errors:
+        raise HTTPException(status_code=400, detail={"message": "CSV validation failed", "errors": errors[:200]})
+
+    created_members = 0
+    preferences_created = 0
+    for r in valid:
+        mem = models.Member(
+            first_name=r["first_name"],
+            last_name=r["last_name"],
+            phone=r["phone"],
+            gender=r["gender"],
+            birth_date=r["birth_date"],
+        )
+        db.add(mem)
+        db.flush()
+        created_members += 1
+
+        pref = models.MemberPreference(
+            event_id=event_id,
+            member_id=mem.id,
+            invite_token=str(uuid4()),
+        )
+        db.add(pref)
+        preferences_created += 1
+
+    db.commit()
+    return {
+        "ok": True,
+        "dry_run": False,
+        "created_members": created_members,
+        "preferences_created": preferences_created,
+        "preferences_updated": 0,
+        "errors": [],
     }

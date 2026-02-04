@@ -7,8 +7,7 @@ from app.routers.organizations import router as organizations_router
 from app.routers.venues import router as venues_router
 from app.routers.events import router as events_router
 from app.routers.portal import router as portal_router
-from app.deps import get_current_user
-
+from app import models
 
 Base.metadata.create_all(bind=engine)
 

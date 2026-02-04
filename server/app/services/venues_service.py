@@ -18,7 +18,7 @@ def list_venues(db: Session):
     rows = (
         db.query(
             models.Venue,
-            func.count(models.Seat.id).label("seat_count"),
+            func.count(distinct(models.Seat.id)).label("seat_count"),
             func.count(distinct(models.Seat.zone)).label("zones_count"),
             func.count(distinct(models.Event.id)).label("events_count"),
         )

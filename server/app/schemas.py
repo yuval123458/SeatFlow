@@ -153,7 +153,7 @@ class ParticipantLink(BaseModel):
     assigned_seat_code: Optional[str] = None
 
 class ZoneSpec(BaseModel):
-    zone: str = Field(..., min_length=1, max_length=50)   # e.g. VIP / Premium / General
+    zone: str = Field(..., min_length=1, max_length=50) 
     rows: int = Field(..., ge=1, le=200)
     seats_per_row: int = Field(..., ge=1, le=500)
 
@@ -161,14 +161,14 @@ class GenerateSeatsZone(BaseModel):
     zone: str
     rows: int = Field(..., ge=1)
     seats_per_row: int = Field(..., ge=1)
-    aisle_seat_numbers: List[int] = []  # unchanged: applies to every row
-    accessible_rows: List[int] = []                 # e.g., [1,2,10]
-    accessible_per_row: int = Field(1, ge=1)       # how many seats per affected row
+    aisle_seat_numbers: List[int] = []  
+    accessible_rows: List[int] = []                
+    accessible_per_row: int = Field(1, ge=1)       
     accessible_side: Literal["start", "end", "both"] = "start"
 
 class GenerateSeatsPayload(BaseModel):
     zones: List[GenerateSeatsZone]
-    layout: Literal["horizontal", "vertical"] = "horizontal"  # NEW
+    layout: Literal["horizontal", "vertical"] = "horizontal" 
 
 class PortalData(BaseModel):
     event_name: str

@@ -50,10 +50,8 @@ export function TopNavbar({
         const me = await getMe();
         if (cancelled) return;
         setOrgName(me.org_name);
-        setDisplayName(me.email); // or change to first+last if you add those to /auth/me
-      } catch {
-        // fallback (token missing/expired): keep placeholders
-      }
+        setDisplayName(me.email);
+      } catch {}
     })();
 
     return () => {
@@ -64,7 +62,6 @@ export function TopNavbar({
   const handleLogout = async () => {
     await apiLogout();
     onLogout?.();
-    // minimal fallback if no routing logic is wired:
     window.location.href = "/login";
   };
 
@@ -93,7 +90,6 @@ export function TopNavbar({
             </div>
           </div>
 
-          {/* Right: Actions */}
           <div className="flex items-center gap-2">
             <Button
               variant="ghost"
@@ -121,14 +117,6 @@ export function TopNavbar({
               <DropdownMenuContent align="end" className="w-56">
                 <DropdownMenuLabel>My Account</DropdownMenuLabel>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem>
-                  <User className="mr-2 h-4 w-4" />
-                  Profile
-                </DropdownMenuItem>
-                <DropdownMenuItem>
-                  <Settings className="mr-2 h-4 w-4" />
-                  Settings
-                </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   className="text-[#DC2626]"

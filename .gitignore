@@ -20,12 +20,6 @@ server/__pycache__/
 *.pyc
 
 # Env / secrets
-.env
-.env.*
-client/.env
-client/.env.*
-server/.env
-server/.env.*
 
 # Editor / OS files
 .vscode/*

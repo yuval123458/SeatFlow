@@ -3,13 +3,15 @@ import hashlib
 import os
 import secrets
 from typing import Any, Dict
+from app.settings import settings
+
 
 from jose import jwt
 from passlib.context import CryptContext
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-JWT_SECRET = os.getenv("JWT_SECRET", "dev-insecure-change-me")
+JWT_SECRET = settings.JWT_SECRET
 JWT_ALG = os.getenv("JWT_ALG", "HS256")
 ACCESS_TOKEN_MINUTES = int(os.getenv("ACCESS_TOKEN_MINUTES", "1000"))
 

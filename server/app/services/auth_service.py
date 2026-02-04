@@ -8,6 +8,8 @@ from fastapi import HTTPException
 from jose import jwt, JWTError
 from sqlalchemy.orm import Session
 
+from app.settings import settings
+
 from app import models, schemas
 from app.security import (
     verify_password,
@@ -17,7 +19,7 @@ from app.security import (
     refresh_expiry,
 )
 
-JWT_SECRET = os.getenv("JWT_SECRET", "dev-insecure-change-me")
+JWT_SECRET = settings.JWT_SECRET
 JWT_ALG = os.getenv("JWT_ALG", "HS256")
 
 
