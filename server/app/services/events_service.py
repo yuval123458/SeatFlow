@@ -111,7 +111,6 @@ def get_event(db: Session, event_id: int):
     }
 
 
-STRICT_THRESH = 0.90 
 
 def _parse_flat_weights(payload: Dict[str, Any]) -> Tuple[Dict[str, float], Dict[str, float]]:
     # Safe parsing with defaults; group is ignored downstream
@@ -123,7 +122,7 @@ def _parse_flat_weights(payload: Dict[str, Any]) -> Tuple[Dict[str, float], Dict
             raise HTTPException(status_code=400, detail=f"{k} must be between 0 and 100")
     return (
         {"preference_weight": pref_raw, "stability_weight": stab_raw, "group_weight": grp_raw},
-        {"member_preference": pref_raw / 100.0, "stability": stab_raw / 100.0, "group": 0.0},  # group soft disabled
+        {"member_preference": pref_raw / 100.0, "stability": stab_raw / 100.0, "group": 0.0},
     )
 
 def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]]):
@@ -152,32 +151,10 @@ def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]
     seat_by_id = {int(s.id): s for s in seats}
     zone_of_sid: Dict[int, Optional[str]] = {int(s.id): getattr(s, "zone", None) for s in seats}
 
-    # Spatial and row info
-    seat_xy: Dict[int, Tuple[float, float]] = {}
-    try:
-        for s in seats:
-            x = getattr(s, "x", None)
-            y = getattr(s, "y", None)
-            if x is not None and y is not None:
-                seat_xy[int(s.id)] = (float(x), float(y))
-    except Exception:
-        seat_xy = {}
-    has_xy = len(seat_xy) > 0
-
     row_of_sid: Dict[int, Any] = {}
     if any(hasattr(s, "row_label") for s in seats):
         for s in seats:
             row_of_sid[int(s.id)] = getattr(s, "row_label")
-    elif has_xy:
-        ys_sorted = sorted({pt[1] for pt in seat_xy.values()})
-        bucket = 10.0
-        if len(ys_sorted) >= 2:
-            gaps = [abs(ys_sorted[i+1] - ys_sorted[i]) for i in range(len(ys_sorted)-1)]
-            gaps.sort()
-            med_gap = gaps[len(gaps)//2] if gaps else 1.0
-            bucket = max(1.0, med_gap * 0.6)
-        for sid, (_, y) in seat_xy.items():
-            row_of_sid[int(sid)] = int(round(y / bucket))
     else:
         for s in seats:
             row_of_sid[int(s.id)] = "row-0"
@@ -207,6 +184,11 @@ def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]
     used: Set[int] = set(curr_assigned_seats)
     free: Set[int] = {int(s.id) for s in seats if int(getattr(s, "is_blocked", 0) or 0) == 0} - used
     acc_demand_remaining = sum(1 for p in prefs if int(getattr(p, "needs_accessible", 0) or 0) == 1)
+
+    # If stability is not strict, make all previous seats available for reallocation
+    if not strict_stab:
+        free |= used
+        used.clear()
 
     planned: Dict[int, Optional[int]] = {}  # pref_id -> seat_id
     prefs_by_id: Dict[int, models.MemberPreference] = {int(p.id): p for p in prefs}
@@ -270,9 +252,6 @@ def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]
                     return (0, int(sn))
                 except Exception:
                     return (0, str(sn))
-            if has_xy:
-                return (1, seat_xy.get(int(sid), (0.0, 0.0))[0])
-            return (2, int(sid))
 
         def free_rows_by_zone(zone: Optional[str]) -> Dict[Any, List[int]]:
             rows: Dict[Any, List[int]] = defaultdict(list)
@@ -284,10 +263,29 @@ def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]
                 rows[row_of_sid.get(sid, 0)].append(int(sid))
             return {rk: sorted(arr, key=row_sort_key) for rk, arr in rows.items() if arr}
 
+
         def windows_of_size(arr: List[int], k: int) -> List[List[int]]:
             if k <= 0 or len(arr) < k:
                 return []
-            return [arr[i:i + k] for i in range(0, len(arr) - k + 1)]
+
+            def sn(sid: int) -> Optional[int]:
+                s = seat_by_id[sid]
+                val = getattr(s, "seat_number", None)
+                try:
+                    return int(val)
+                except Exception:
+                    return None
+
+            wins: List[List[int]] = []
+            ordered = arr  
+            for i in range(0, len(ordered) - k + 1):
+                block = ordered[i:i + k]
+                nums = [sn(sid) for sid in block]
+                if any(n is None for n in nums):
+                    continue
+                if all(nums[j] == nums[j - 1] + 1 for j in range(1, k)):
+                    wins.append(block)
+            return wins
 
         def choose_group_zone(members: List[models.MemberPreference]) -> Optional[str]:
             pref_counts = Counter((getattr(m, "preferred_zone", None) or None) for m in members)
@@ -414,7 +412,6 @@ def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]
 
     def candidate_list_for(p, allow_use_accessible: bool = False) -> List[int]:
         c = [sid for sid in list(free) if sid not in used and hard_ok(p, seat_by_id[sid])]
-        # If member has an explicit preferred zone, restrict candidates to that zone first-pass.
         pref_zone = getattr(p, "preferred_zone", None)
         if pref_zone:
             cz = [sid for sid in c if getattr(seat_by_id[sid], "zone", None) == pref_zone]
@@ -428,21 +425,12 @@ def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]
                 c = [sid for sid in c if sid not in accessible_seat_ids]
         return c
 
-    # Use cache only for scarcity ordering
+    # Use cache for scarcity ordering
     cand_cache: Dict[int, int] = {int(p.id): len(candidate_list_for(p)) for p in remaining}
     remaining_ordered = sorted(remaining, key=lambda p: cand_cache.get(int(p.id), 0))
-
-    # Respect per-member hard rule even if global strict is off
+    
     def is_member_strict(p) -> bool:
-        # Treat explicit zone preference as strict for zone matching, so we don't ignore requested zones (e.g., VIP)
-        has_explicit_zone = bool((getattr(p, "preferred_zone", None) or "").strip())
-        return bool(
-            getattr(p, "hard_rule", 0)
-            or getattr(p, "has_hard_rule", 0)
-            or getattr(p, "strict", 0)
-            or strict_member
-            or has_explicit_zone
-        )
+        return bool(strict_member or (p.preferred_zone and p.preferred_zone.strip()))
     
     # Dynamic weighting based on current demand/supply in zones and aisle scarcity
     def compute_dynamic_weights(remaining_members: List[models.MemberPreference], free_seats: Set[int]):
@@ -473,7 +461,7 @@ def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]
             zone_pressure[z] = float(d) / float(s)
         max_zone_pressure = max(zone_pressure.values(), default=1.0)
 
-        # Normalize aisle pressure 0..1 (>=1 means very scarce)
+        # Normalize aisle pressure 0..1 (>=1 - very scarce)
         aisle_pressure = 0.0
         if want_aisle_count > 0:
             aisle_pressure = min(1.0, float(want_aisle_count) / float(max(1, free_aisle_count)))
@@ -518,22 +506,22 @@ def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]
         wants_aisle = bool(getattr(p, "wants_aisle", 0))
         prev_sid = prev_seat_by_pref.get(int(p.id))
 
-        def score(sid: int):
+        def score(sid: int) -> float:
             s = seat_by_id[sid]
-            z_match = 1 if (pref_zone and getattr(s, "zone", None) == pref_zone) else 0
-            a_match = 1 if (wants_aisle and bool(getattr(s, "is_aisle", 0))) else 0
-            keep = 1 if (prev_sid and prev_sid == sid) else 0
+            z_match = 1.0 if (pref_zone and getattr(s, "zone", None) == pref_zone) else 0.0
+            a_match = 1.0 if (wants_aisle and bool(getattr(s, "is_aisle", 0))) else 0.0
+            keep = 1.0 if (prev_sid and prev_sid == sid) else 0.0
             w_zone = dynw["zone_weight_for"](pref_zone) if pref_zone else 0.0
             w_aisle = dynw["aisle_weight"]
             w_stb = dynw["stability_weight"]
             pop_pen = 0.15 * dynw["popularity"].get(sid, 0.0)
-            return (z_match * w_zone + a_match * w_aisle + keep * w_stb - pop_pen, -int(sid))
+            return z_match * w_zone + a_match * w_aisle + keep * w_stb - pop_pen
 
         return max(candidate_ids, key=score)
 
     def pick_nonconflicting(p, candidates: List[int], dynw) -> Optional[int]:
         # Try best-scored seats, skipping ones already taken
-        pool = list(dict.fromkeys(candidates))  # dedupe, keep order
+        pool = list(dict.fromkeys(candidates)) 
         while pool:
             sid = soft_pick_v2(p, pool, dynw)
             if sid is None:
@@ -586,7 +574,7 @@ def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]
     if leftovers:
         for p in leftovers:
             pid = int(p.id)
-            cands = candidate_list_for(p, allow_use_accessible=True)  # LIVE recompute
+            cands = candidate_list_for(p, allow_use_accessible=True) 
             if not cands:
                 continue
             if is_member_strict(p):
@@ -629,29 +617,33 @@ def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]
             sid = pick_nonconflicting(p, cands, dynw) if cands else None
             if sid is not None:
                 planned[pid] = int(sid)
-                # release old seat on move
                 old = prev_seat_by_pref.get(pid)
                 if old and int(old) != int(sid):
                     used.discard(int(old))
                     free_pool.add(int(old))
                 free_pool.discard(int(sid))
 
-    curr = prev_seat_by_pref
-    ids_change: List[int] = [pid for pid in curr.keys() if (curr.get(pid) or None) != (planned.get(pid) or None)]
-    to_set: List[Tuple[int, int]] = [(pid, int(sid)) for pid, sid in planned.items() if sid is not None and pid in ids_change]
+    db.execute(
+        text("UPDATE member_preferences SET assigned_seat_id = NULL WHERE event_id = :eid"),
+        {"eid": event_id},
+    )
 
-    if ids_change:
-        db.execute(
-            text("UPDATE member_preferences SET assigned_seat_id = NULL WHERE event_id = :eid AND id IN :ids")
-            .bindparams(bindparam("ids", expanding=True)),
-            {"eid": event_id, "ids": ids_change},
-        )
+    to_set: List[Tuple[int, int]] = [(pid, int(sid)) for pid, sid in planned.items() if sid is not None]
 
     if to_set:
-        db.execute(
-            text("UPDATE member_preferences SET assigned_seat_id = :sid WHERE event_id = :eid AND id = :pid"),
-            [{"eid": event_id, "pid": int(pid), "sid": int(sid)} for pid, sid in to_set],
-        )
+        seen_sids: Set[int] = set()
+        to_write: List[Dict[str, int]] = []
+        for pid, sid in to_set:
+            if sid in seen_sids:
+                continue
+            seen_sids.add(sid)
+            to_write.append({"eid": event_id, "pid": int(pid), "sid": int(sid)})
+
+        if to_write:
+            db.execute(
+                text("UPDATE member_preferences SET assigned_seat_id = :sid WHERE event_id = :eid AND id = :pid"),
+                to_write,
+            )
 
     db.commit()
 
