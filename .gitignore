@@ -20,6 +20,15 @@ server/__pycache__/
 *.pyc
 
 # Env / secrets
+.env
+.env.*
+!.env.example
+
+# Solver (Java)
+solver/target/
+
+# Claude planning docs
+docs/superpowers/
 
 # Editor / OS files
 .vscode/*

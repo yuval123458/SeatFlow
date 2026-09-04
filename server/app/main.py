@@ -1,5 +1,10 @@
+import logging
+
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware  
+from fastapi.middleware.cors import CORSMiddleware
+
+# Uvicorn only configures its own loggers; this makes the app's INFO lines show in the terminal too.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s - %(message)s")
  
 from .db import Base, engine
 from app.routers.auth import router as auth_router

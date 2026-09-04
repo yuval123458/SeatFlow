@@ -7,12 +7,16 @@ from sqlalchemy import func, text, bindparam
 from sqlalchemy.exc import OperationalError
 from fastapi import HTTPException, UploadFile
 import csv, re
-import math, time
+import json, logging
+import urllib.request, urllib.error
 from io import StringIO
 from uuid import uuid4
 from collections import Counter, defaultdict
 
 from app import models, schemas
+from app.settings import settings
+
+log = logging.getLogger(__name__)
 
 
 def list_events(db: Session):
@@ -125,6 +129,83 @@ def _parse_flat_weights(payload: Dict[str, Any]) -> Tuple[Dict[str, float], Dict
         {"member_preference": pref_raw / 100.0, "stability": stab_raw / 100.0, "group": 0.0},
     )
 
+def _solve_with_java(seats, prefs, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """POST the problem to the Java solver. Returns its response, or None if it is unavailable."""
+    if not settings.SOLVER_URL:
+        return None
+
+    def _int_or_none(v):
+        try:
+            return int(str(v).strip())
+        except Exception:
+            return None
+
+    body = {
+        "seats": [
+            {
+                "id": int(s.id),
+                "zone": s.zone,
+                "rowLabel": s.row_label,
+                "seatNumber": _int_or_none(s.seat_number),
+                "x": float(s.x or 0),
+                "y": float(s.y or 0),
+                "aisle": bool(s.is_aisle),
+                "accessible": bool(s.is_accessible),
+                "blocked": bool(s.is_blocked),
+            }
+            for s in seats
+        ],
+        "people": [
+            {
+                "id": int(p.id),
+                "groupCode": p.group_code,
+                "preferredZone": p.preferred_zone,
+                "wantsAisle": bool(p.wants_aisle),
+                "needsAccessible": bool(p.needs_accessible),
+                "previousSeatId": int(p.assigned_seat_id) if p.assigned_seat_id else None,
+            }
+            for p in prefs
+        ],
+        "preferenceWeight": int(float(payload.get("preference_weight", 50))),
+        "stabilityWeight": int(float(payload.get("stability_weight", 50))),
+        "groupAdjacency": bool(payload.get("group_adjacency", True)),
+        "runs": int(payload.get("runs", settings.SOLVER_RUNS)),
+    }
+    req = urllib.request.Request(
+        settings.SOLVER_URL.rstrip("/") + "/solve",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+        log.warning("Java solver unavailable (%s); falling back to Python heuristic", e)
+        return None
+
+
+def _persist_plan(db: Session, event_id: int, planned: Dict[int, Optional[int]]) -> None:
+    """Overwrite the event's assignments with the given plan (pref_id -> seat_id)."""
+    db.execute(
+        text("UPDATE member_preferences SET assigned_seat_id = NULL WHERE event_id = :eid"),
+        {"eid": event_id},
+    )
+    seen_sids: Set[int] = set()
+    to_write: List[Dict[str, int]] = []
+    for pid, sid in planned.items():
+        if sid is None or sid in seen_sids:
+            continue
+        seen_sids.add(sid)
+        to_write.append({"eid": event_id, "pid": int(pid), "sid": int(sid)})
+    if to_write:
+        db.execute(
+            text("UPDATE member_preferences SET assigned_seat_id = :sid WHERE event_id = :eid AND id = :pid"),
+            to_write,
+        )
+    db.commit()
+
+
 def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]]):
     payload = payload or {}
     _, weights = _parse_flat_weights(payload)
@@ -170,6 +251,28 @@ def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]
         .order_by(models.MemberPreference.id.asc())
         .all()
     )
+
+    # Prefer the Java solver (N parallel randomized runs, best plan wins).
+    solved = _solve_with_java(seats, prefs, payload)
+    if solved is not None:
+        planned_java = {int(pid): int(sid) for pid, sid in solved["assignments"].items()}
+        log.info(
+            "event %s: Java solver seated %d/%d, score %.1f (best of %d runs, %d ms) %s",
+            event_id, len(planned_java), len(prefs), solved["score"], solved["runs"],
+            solved["elapsedMs"], solved["breakdown"],
+        )
+        _persist_plan(db, event_id, planned_java)
+        return {
+            "status": "ok",
+            "solver": "java",
+            "score": solved["score"],
+            "breakdown": solved["breakdown"],
+            "unseated": solved["unseatedPersonIds"],
+            "runs": solved["runs"],
+            "elapsed_ms": solved["elapsedMs"],
+            "weights_used": {"member_preference": w_pref, "stability": w_stab},
+            "group_adjacency": group_adjacency,
+        }
 
     # Snapshot previous seats for stability (and current map for diff apply)
     prev_seat_by_pref: Dict[int, Optional[int]] = {
@@ -623,32 +726,11 @@ def run_assignments(db: Session, event_id: int, payload: Optional[Dict[str, Any]
                     free_pool.add(int(old))
                 free_pool.discard(int(sid))
 
-    db.execute(
-        text("UPDATE member_preferences SET assigned_seat_id = NULL WHERE event_id = :eid"),
-        {"eid": event_id},
-    )
-
-    to_set: List[Tuple[int, int]] = [(pid, int(sid)) for pid, sid in planned.items() if sid is not None]
-
-    if to_set:
-        seen_sids: Set[int] = set()
-        to_write: List[Dict[str, int]] = []
-        for pid, sid in to_set:
-            if sid in seen_sids:
-                continue
-            seen_sids.add(sid)
-            to_write.append({"eid": event_id, "pid": int(pid), "sid": int(sid)})
-
-        if to_write:
-            db.execute(
-                text("UPDATE member_preferences SET assigned_seat_id = :sid WHERE event_id = :eid AND id = :pid"),
-                to_write,
-            )
-
-    db.commit()
+    _persist_plan(db, event_id, planned)
 
     return {
         "status": "ok",
+        "solver": "python",
         "weights_used": {"member_preference": w_pref, "stability": w_stab},
         "group_adjacency": group_adjacency,
     }

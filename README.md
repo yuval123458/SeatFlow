@@ -6,6 +6,7 @@ This repo contains:
 
 - server/ — FastAPI backend (Python)
 - client/ — Vite + React frontend (TypeScript)
+- solver/ — Spring Boot seating solver (Java)
 - server/seatflow.sql — database dump (schema + data)
 
 Quick links:
@@ -75,13 +76,34 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Environment (this repo includes server/.env for convenience):
+Environment (copy `server/.env.example` to `server/.env` and adjust if needed):
 
 Run the API:
 
 ```
 uvicorn app.main:app --reload --port 8000
 ```
+
+## 2b) Seating solver (Java / Spring Boot)
+
+The seat-assignment algorithm runs in a separate Java service under `solver/`.
+It runs the greedy heuristic 100 times in parallel on real threads, each with
+different random noise, scores every plan, and returns the best one. The Python
+backend calls it when you click **Run** on an event and saves the winning plan.
+
+Requires Java 21+ (`java -version`). Maven is downloaded automatically by the wrapper.
+
+```
+cd solver
+./mvnw spring-boot:run
+```
+
+Listens on http://localhost:8081. Stop with Ctrl+C.
+
+The backend finds it via `SOLVER_URL` (default `http://localhost:8081`) and
+`SOLVER_RUNS` (default 100) in `server/.env`. If the solver is not running, the
+backend logs a warning and falls back to the built-in Python heuristic, so nothing
+breaks. The run response says which one was used (`"solver": "java"` or `"python"`).
 
 ## 3) Frontend (Vite + React)
 
@@ -92,7 +114,7 @@ cd client
 npm install
 ```
 
-Environment (this repo includes client/src/.env for convenience):
+Environment (copy `client/src/.env.example` to `client/src/.env`):
 
 Run the web app:
 
@@ -135,5 +157,5 @@ server/.venv/bin/python -m uvicorn app.main:app --reload --port 8000
 
 ## Notes
 
-- This project commits .env files for ease of study. In real apps, use .env.example and keep secrets out of git.
+- .env files are git-ignored; .env.example files show the expected variables.
 - Manual seat moves in the UI are allowed even if they violate accessibility preferences; use the Issues panel to review such cases.
